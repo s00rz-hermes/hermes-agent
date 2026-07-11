@@ -205,6 +205,225 @@ class TestPayloadSanitization:
         }
 
 
+class TestDesktopTraceMetadata:
+    def _fresh_plugin(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        return importlib.import_module("plugins.observability.langfuse")
+
+    @staticmethod
+    def _clear_trace_metadata_env(monkeypatch):
+        for key in (
+            "HERMES_LANGFUSE_TRACE_METADATA_JSON",
+            "HERMES_PROFILE",
+            "HERMES_TENANT",
+            "HERMES_KANBAN_TASK",
+            "HERMES_KANBAN_RUN_ID",
+            "HERMES_CRON_SESSION",
+            "HERMES_CRON_JOB_ID",
+            "HERMES_PARENT_SESSION_ID",
+            "PARENT_SESSION_ID",
+            "HERMES_SESSION_SOURCE",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+    def test_runtime_trace_metadata_defaults_unified_identity_schema_for_default_profile(self, monkeypatch, tmp_path):
+        self._clear_trace_metadata_env(monkeypatch)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-desktop"))
+        mod = self._fresh_plugin()
+
+        metadata = mod._runtime_trace_metadata(platform="telegram", session_id="session-1")
+
+        assert metadata["identity_schema_version"] == "hermes.trace_identity.v1"
+        assert metadata["profile_name"] == "default"
+        assert metadata["execution_surface"] == "gateway"
+        assert metadata["runtime_kind"] == "gateway"
+
+    def test_extra_trace_metadata_sanitizes_env_json_without_overriding_core_fields(self, monkeypatch, tmp_path):
+        self._clear_trace_metadata_env(monkeypatch)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        monkeypatch.setenv(
+            "HERMES_LANGFUSE_TRACE_METADATA_JSON",
+            '{"profile_name":"refactorer","runtime_kind":"kanban_worker",'
+            '"identity_schema_version":"hermes.desktop_trace_metadata.v1",'
+            '"source":"evil","task_id":"evil-task","secret_token":"drop-me",'
+            '"nested":{"safe":"keep","api_key":"drop-me"}}',
+        )
+        mod = self._fresh_plugin()
+
+        metadata = mod._extra_trace_metadata_from_env()
+
+        assert metadata["profile_name"] == "refactorer"
+        assert metadata["identity_schema_version"] == "hermes.trace_identity.v1"
+        assert metadata["runtime_kind"] == "kanban_worker"
+        assert metadata["nested"] == {"safe": "keep"}
+        assert "source" not in metadata
+        assert "task_id" not in metadata
+        assert "secret_token" not in metadata
+
+    def test_extra_trace_metadata_loads_desktop_env_fragment_when_env_missing(self, monkeypatch, tmp_path):
+        self._clear_trace_metadata_env(monkeypatch)
+        desktop_root = tmp_path / "hermes-desktop"
+        profile_home = desktop_root / "profiles" / "refactorer"
+        fragment_dir = desktop_root / "worker_state" / "langfuse-trace-metadata" / "env.d" / "refactorer"
+        profile_home.mkdir(parents=True)
+        fragment_dir.mkdir(parents=True)
+        (fragment_dir / "kanban.env").write_text(
+            '# BEGIN HERMES DESKTOP LANGFUSE TRACE METADATA\n'
+            'HERMES_LANGFUSE_TRACE_METADATA_JSON="{\\"profile_name\\":\\"refactorer\\",'
+            '\\"identity_schema_version\\":\\"hermes.desktop_trace_metadata.v1\\",'
+            '\\"agent_runtime\\":\\"hermes\\",\\"runtime_kind\\":\\"kanban_worker\\",'
+            '\\"execution_surface\\":\\"kanban\\"}"\n'
+            '# END HERMES DESKTOP LANGFUSE TRACE METADATA\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("HERMES_PROFILE", "refactorer")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_desktop")
+        mod = self._fresh_plugin()
+
+        metadata = mod._extra_trace_metadata_from_env(platform="cli", session_id="session-1")
+
+        assert metadata["profile_name"] == "refactorer"
+        assert metadata["identity_schema_version"] == "hermes.trace_identity.v1"
+        assert metadata["agent_runtime"] == "hermes"
+        assert metadata["runtime_kind"] == "kanban_worker"
+        assert metadata["execution_surface"] == "kanban"
+
+    def test_runtime_trace_metadata_adds_task_run_cron_and_parent_identity(self, monkeypatch, tmp_path):
+        self._clear_trace_metadata_env(monkeypatch)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        monkeypatch.setenv("HERMES_PROFILE", "refactorer")
+        monkeypatch.setenv("HERMES_TENANT", "prospecting")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "2501")
+        mod = self._fresh_plugin()
+
+        metadata = mod._runtime_trace_metadata(
+            task_id="hook-task",
+            session_id="cron_job_with_under_20260711_010203",
+            platform="cron",
+            parent_session_id="parent-session",
+        )
+
+        assert metadata["profile_name"] == "refactorer"
+        assert metadata["identity_schema_version"] == "hermes.trace_identity.v1"
+        assert metadata["tenant"] == "prospecting"
+        assert metadata["kanban_task_id"] == "t_abc123"
+        assert metadata["kanban_run_id"] == "2501"
+        assert metadata["parent_session_id"] == "parent-session"
+        # Kanban identity wins over cron inference when both are present because
+        # a cron scheduler process may still have HERMES_CRON_SESSION set while
+        # running an explicit Kanban worker subprocess.
+        assert "cron_job_id" not in metadata
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+        metadata = mod._runtime_trace_metadata(
+            task_id="",
+            session_id="cron_job_with_under_20260711_010203",
+            platform="cron",
+        )
+        assert metadata["cron_job_id"] == "job_with_under"
+        assert metadata["identity_schema_version"] == "hermes.trace_identity.v1"
+
+    def test_runtime_trace_metadata_adds_delegation_identity_from_hook_payload(self, monkeypatch, tmp_path):
+        self._clear_trace_metadata_env(monkeypatch)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        monkeypatch.setenv("HERMES_PROFILE", "refactorer")
+        mod = self._fresh_plugin()
+
+        metadata = mod._runtime_trace_metadata(
+            session_id="child-session",
+            platform="subagent",
+            parent_session_id="parent-session",
+            delegate_depth=1,
+            delegate_role="leaf",
+            subagent_id="sa-0-deadbeef",
+        )
+
+        assert metadata["execution_surface"] == "delegation"
+        assert metadata["runtime_kind"] == "subagent"
+        assert metadata["parent_session_id"] == "parent-session"
+        assert metadata["delegation_depth"] == 1
+        assert metadata["delegation_role"] == "leaf"
+        assert metadata["subagent_id"] == "sa-0-deadbeef"
+
+    def test_start_root_trace_merges_metadata_without_replacing_trace_input(self, monkeypatch, tmp_path):
+        self._clear_trace_metadata_env(monkeypatch)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        monkeypatch.setenv("HERMES_PROFILE", "refactorer")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "2501")
+        monkeypatch.setenv(
+            "HERMES_LANGFUSE_TRACE_METADATA_JSON",
+            '{"profile_name":"refactorer","agent_runtime":"hermes",'
+            '"identity_schema_version":"hermes.desktop_trace_metadata.v1",'
+            '"runtime_kind":"kanban_worker","execution_surface":"kanban",'
+            '"source":"evil"}',
+        )
+        mod = self._fresh_plugin()
+        started = {}
+
+        class _Span:
+            def set_trace_io(self, **kwargs):
+                started.setdefault("trace_io", {}).update(kwargs)
+
+            def update(self, **kwargs):
+                started.setdefault("updates", []).append(kwargs)
+
+            def start_observation(self, **kwargs):
+                return _Span()
+
+            def end(self, **kwargs):
+                pass
+
+        class _RootCM:
+            def __enter__(self):
+                return _Span()
+
+            def __exit__(self, *exc):
+                return False
+
+        class _Client:
+            def create_trace_id(self, seed=None):
+                return f"trace::{seed}"
+
+            def start_as_current_observation(self, **kwargs):
+                started["root_kwargs"] = kwargs
+                return _RootCM()
+
+        state = mod._start_root_trace(
+            "task-key",
+            task_id="hook-task",
+            session_id="session-1",
+            platform="cli",
+            provider="openai-codex",
+            model="gpt-5.5",
+            api_mode="chat_completions",
+            messages=[{"role": "user", "content": "keep this prompt"}],
+            client=_Client(),
+            turn_id="turn-1",
+            api_request_id="api-1",
+            parent_session_id="parent-session",
+        )
+
+        assert state.trace_id == "trace::session-1::hook-task"
+        root_kwargs = started["root_kwargs"]
+        assert root_kwargs["input"] == {"role": "user", "content": "keep this prompt"}
+        assert started["trace_io"]["input"] == {"role": "user", "content": "keep this prompt"}
+        metadata = root_kwargs["metadata"]
+        assert metadata["source"] == "hermes"
+        assert metadata["task_id"] == "hook-task"
+        assert metadata["profile_name"] == "refactorer"
+        assert metadata["identity_schema_version"] == "hermes.trace_identity.v1"
+        assert metadata["agent_runtime"] == "hermes"
+        assert metadata["runtime_kind"] == "kanban_worker"
+        assert metadata["execution_surface"] == "kanban"
+        assert metadata["kanban_task_id"] == "t_abc123"
+        assert metadata["kanban_run_id"] == "2501"
+        assert metadata["parent_session_id"] == "parent-session"
+
+
 class TestTraceScopeKey:
     def _fresh_plugin(self):
         mod_name = "plugins.observability.langfuse"

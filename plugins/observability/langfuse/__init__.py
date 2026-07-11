@@ -18,6 +18,7 @@ Optional env vars:
   HERMES_LANGFUSE_RELEASE     - release/version tag
   HERMES_LANGFUSE_SAMPLE_RATE - sampling rate 0.0–1.0 (default: 1.0)
   HERMES_LANGFUSE_MAX_CHARS   - max chars per field (default: 12000)
+  HERMES_LANGFUSE_TRACE_METADATA_JSON - JSON object merged into root trace metadata
   HERMES_LANGFUSE_DEBUG       - set to "true" for verbose logging
 """
 from __future__ import annotations
@@ -26,9 +27,11 @@ import json
 import logging
 import os
 import re
+import shlex
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -78,6 +81,24 @@ _LANGFUSE_KEY_PREFIXES: Dict[str, str] = {
     "HERMES_LANGFUSE_PUBLIC_KEY": "pk-lf-",
     "HERMES_LANGFUSE_SECRET_KEY": "sk-lf-",
 }
+
+_TRACE_METADATA_ENV_VAR = "HERMES_LANGFUSE_TRACE_METADATA_JSON"
+_TRACE_IDENTITY_SCHEMA_VERSION = "hermes.trace_identity.v1"
+_TRACE_METADATA_FRAGMENT_MAX_BYTES = 64 * 1024
+_TRACE_METADATA_RESERVED_KEYS = {
+    "source",
+    "task_id",
+    "turn_id",
+    "api_request_id",
+    "platform",
+    "provider",
+    "model",
+    "api_mode",
+}
+_TRACE_METADATA_SENSITIVE_KEY_RE = re.compile(
+    r"(secret|token|password|credential|authorization|api[_-]?key|email|body|content|raw|html|prompt|dsn|connection[_-]?string|private[_-]?key|bearer)",
+    re.IGNORECASE,
+)
 
 
 def _env(name: str, default: str = "") -> str:
@@ -455,6 +476,245 @@ def _safe_value(value: Any, *, max_chars: Optional[int] = None, depth: int = 0,
     return _truncate_text(repr(value), max_chars)
 
 
+def _sanitize_trace_metadata(value: Any, *, depth: int = 0) -> Any:
+    """Return a Langfuse-safe metadata value, dropping sensitive-looking keys."""
+    if depth > 4:
+        return "<max-depth>"
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, item in list(value.items())[:50]:
+            key_text = str(key)
+            if _TRACE_METADATA_SENSITIVE_KEY_RE.search(key_text):
+                continue
+            sanitized[key_text] = _sanitize_trace_metadata(item, depth=depth + 1)
+        return sanitized
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_trace_metadata(item, depth=depth + 1) for item in list(value)[:50]]
+    return _safe_value(value, depth=depth)
+
+
+def _trace_metadata_profile_name() -> str:
+    profile = _env("HERMES_PROFILE")
+    if profile:
+        return profile
+    home_raw = _env("HERMES_HOME")
+    if not home_raw:
+        return ""
+    try:
+        home = Path(home_raw).expanduser()
+        if home.name and home.parent.name.lower() == "profiles":
+            return home.name
+    except Exception:
+        return ""
+    return "default"
+
+
+def _infer_cron_job_id(session_id: str) -> str:
+    match = re.match(r"^cron_(?P<job_id>.+)_\d{8}_\d{6}$", str(session_id or ""))
+    if not match:
+        return ""
+    return match.group("job_id")
+
+
+def _is_cron_trace_context(platform: str = "", session_id: str = "") -> bool:
+    if _env_bool("HERMES_CRON_SESSION"):
+        return True
+    if str(platform or "").strip().lower() == "cron":
+        return True
+    return bool(_infer_cron_job_id(session_id))
+
+
+def _trace_metadata_surface(platform: str = "", session_id: str = "") -> str:
+    if _env("HERMES_KANBAN_TASK"):
+        return "kanban"
+    if _is_cron_trace_context(platform, session_id):
+        return "cron"
+    source = _env("HERMES_SESSION_SOURCE").lower()
+    identity = source or str(platform or "").strip().lower()
+    if identity in {"cli", "tui", "acp", "local-cli", "local_cli"}:
+        return "local-cli"
+    if identity in {"subagent", "delegate", "delegation", "async_delegation"}:
+        return "delegation"
+    return "gateway"
+
+
+def _candidate_trace_metadata_fragment_paths(platform: str = "", session_id: str = "") -> list[Path]:
+    home_raw = _env("HERMES_HOME")
+    if not home_raw:
+        return []
+    try:
+        home = Path(home_raw).expanduser()
+    except Exception:
+        return []
+
+    roots: list[Path] = []
+    if home.name and home.parent.name.lower() == "profiles":
+        roots.append(home.parent.parent)
+    roots.append(home)
+
+    profile = _trace_metadata_profile_name() or "default"
+    surface = _trace_metadata_surface(platform, session_id)
+    rel = Path("worker_state") / "langfuse-trace-metadata" / "env.d" / profile / f"{surface}.env"
+
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        candidate = root / rel
+        key = str(candidate)
+        if key not in seen:
+            paths.append(candidate)
+            seen.add(key)
+    return paths
+
+
+def _parse_trace_metadata_env_fragment(text: str) -> str:
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        try:
+            tokens = shlex.split(stripped, comments=False, posix=True)
+        except ValueError:
+            tokens = [stripped]
+        for token in tokens:
+            if token.startswith(_TRACE_METADATA_ENV_VAR + "="):
+                return token.split("=", 1)[1]
+    return ""
+
+
+def _trace_metadata_json_from_fragment(platform: str = "", session_id: str = "") -> str:
+    for path in _candidate_trace_metadata_fragment_paths(platform, session_id):
+        try:
+            if not path.is_file() or path.stat().st_size > _TRACE_METADATA_FRAGMENT_MAX_BYTES:
+                continue
+            raw = _parse_trace_metadata_env_fragment(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # pragma: no cover - fail-open filesystem edge
+            _debug(f"trace metadata fragment read failed: {exc}")
+            continue
+        if raw:
+            return raw
+    return ""
+
+
+def _extra_trace_metadata_from_env(platform: str = "", session_id: str = "") -> Dict[str, Any]:
+    """Parse optional root trace metadata from env or Desktop env fragments."""
+    raw = _env(_TRACE_METADATA_ENV_VAR) or _trace_metadata_json_from_fragment(platform, session_id)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:  # pragma: no cover - exact parser errors unimportant
+        _debug(f"trace metadata parse failed: {exc}")
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+
+    sanitized = _sanitize_trace_metadata(parsed)
+    if not isinstance(sanitized, dict):
+        return {}
+    extra = {
+        key: value
+        for key, value in sanitized.items()
+        if key not in _TRACE_METADATA_RESERVED_KEYS
+    }
+    if extra:
+        extra["identity_schema_version"] = _TRACE_IDENTITY_SCHEMA_VERSION
+    return extra
+
+
+def _runtime_trace_metadata(*, task_id: str = "", session_id: str = "", platform: str = "",
+                            parent_session_id: str = "", delegate_depth: Any = None,
+                            delegate_role: str = "", subagent_id: str = "") -> Dict[str, Any]:
+    """Build dynamic Hermes runtime identity for root trace metadata."""
+    metadata: Dict[str, Any] = {
+        "agent_runtime": "hermes",
+        "identity_schema_version": _TRACE_IDENTITY_SCHEMA_VERSION,
+    }
+    profile = _trace_metadata_profile_name()
+    if profile:
+        metadata["profile_name"] = profile
+    tenant = _env("HERMES_TENANT")
+    if tenant:
+        metadata["tenant"] = tenant
+    if session_id:
+        metadata["session_id"] = session_id
+    session_source = _env("HERMES_SESSION_SOURCE") or str(platform or "").strip()
+    if session_source:
+        metadata["session_source"] = session_source
+
+    surface = _trace_metadata_surface(platform, session_id)
+    if surface:
+        metadata["execution_surface"] = "cli" if surface == "local-cli" else surface
+        runtime_kind = {
+            "kanban": "kanban_worker",
+            "cron": "cron",
+            "gateway": "gateway",
+            "local-cli": "local_cli",
+            "delegation": "subagent",
+        }.get(surface, surface.replace("-", "_"))
+        metadata["runtime_kind"] = runtime_kind
+
+    kanban_task_id = _env("HERMES_KANBAN_TASK")
+    if kanban_task_id:
+        metadata["kanban_task_id"] = kanban_task_id
+        kanban_run_id = _env("HERMES_KANBAN_RUN_ID")
+        if kanban_run_id:
+            metadata["kanban_run_id"] = kanban_run_id
+    else:
+        cron_job_id = _env("HERMES_CRON_JOB_ID") or _infer_cron_job_id(session_id)
+        if cron_job_id:
+            metadata["cron_job_id"] = cron_job_id
+
+    parent = parent_session_id or _env("HERMES_PARENT_SESSION_ID") or _env("PARENT_SESSION_ID")
+    if parent:
+        metadata["parent_session_id"] = parent
+    if subagent_id:
+        metadata["subagent_id"] = subagent_id
+    if delegate_role:
+        metadata["delegation_role"] = delegate_role
+    if delegate_depth not in (None, ""):
+        try:
+            depth = int(delegate_depth)
+        except (TypeError, ValueError):
+            depth = None
+        if depth and depth > 0:
+            metadata["delegation_depth"] = depth
+
+    sanitized = _sanitize_trace_metadata(metadata)
+    return sanitized if isinstance(sanitized, dict) else {}
+
+
+def _build_root_trace_metadata(*, task_id: str, session_id: str, platform: str, provider: str,
+                               model: str, api_mode: str, turn_id: str = "",
+                               api_request_id: str = "", parent_session_id: str = "",
+                               delegate_depth: Any = None, delegate_role: str = "",
+                               subagent_id: str = "") -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {}
+    metadata.update(_extra_trace_metadata_from_env(platform=platform, session_id=session_id))
+    for key, value in _runtime_trace_metadata(
+        task_id=task_id,
+        session_id=session_id,
+        platform=platform,
+        parent_session_id=parent_session_id,
+        delegate_depth=delegate_depth,
+        delegate_role=delegate_role,
+        subagent_id=subagent_id,
+    ).items():
+        metadata.setdefault(key, value)
+    metadata.update({
+        "identity_schema_version": _TRACE_IDENTITY_SCHEMA_VERSION,
+        "source": "hermes",
+        "task_id": task_id,
+        "turn_id": turn_id,
+        "api_request_id": api_request_id,
+        "platform": platform,
+        "provider": provider,
+        "model": model,
+        "api_mode": api_mode,
+    })
+    return metadata
+
+
 def _extract_last_user_message(messages: Any) -> Any:
     if not isinstance(messages, list):
         return None
@@ -602,19 +862,25 @@ def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, 
 
 def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform: str, provider: str, model: str,
                       api_mode: str, messages: Any, client: Langfuse,
-                      turn_id: str = "", api_request_id: str = "") -> TraceState:
+                      turn_id: str = "", api_request_id: str = "",
+                      parent_session_id: str = "", delegate_depth: Any = None,
+                      delegate_role: str = "", subagent_id: str = "") -> TraceState:
     trace_id = client.create_trace_id(seed=f"{session_id or 'sessionless'}::{task_id or task_key}")
     trace_input = _extract_last_user_message(messages)
-    metadata = {
-        "source": "hermes",
-        "task_id": task_id,
-        "turn_id": turn_id,
-        "api_request_id": api_request_id,
-        "platform": platform,
-        "provider": provider,
-        "model": model,
-        "api_mode": api_mode,
-    }
+    metadata = _build_root_trace_metadata(
+        task_id=task_id,
+        session_id=session_id,
+        platform=platform,
+        provider=provider,
+        model=model,
+        api_mode=api_mode,
+        turn_id=turn_id,
+        api_request_id=api_request_id,
+        parent_session_id=parent_session_id,
+        delegate_depth=delegate_depth,
+        delegate_role=delegate_role,
+        subagent_id=subagent_id,
+    )
 
     # session_id must be passed in trace_context for Langfuse session grouping.
     trace_ctx: Dict[str, Any] = {"trace_id": trace_id}
@@ -778,7 +1044,9 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
                     provider: str = "", base_url: str = "", api_mode: str = "",
                     api_call_count: int = 0, messages: Any = None, turn_type: str = "user",
                     conversation_history: Any = None, user_message: Any = None,
-                    turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
+                    turn_id: str = "", api_request_id: str = "",
+                    parent_session_id: str = "", delegate_depth: Any = None,
+                    delegate_role: str = "", subagent_id: str = "", **_: Any) -> None:
     # Older Hermes branches used pre_llm_call for request-scoped tracing and
     # passed the actual API messages. Current Hermes also has a turn-scoped
     # pre_llm_call used for context injection; tracing that hook creates an
@@ -817,6 +1085,10 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
                 client=client,
                 turn_id=turn_id,
                 api_request_id=api_request_id,
+                parent_session_id=parent_session_id,
+                delegate_depth=delegate_depth,
+                delegate_role=delegate_role,
+                subagent_id=subagent_id,
             )
             _evict_stale_locked()
             _TRACE_STATE[task_key] = state
@@ -845,6 +1117,10 @@ def on_pre_llm_request(
     user_message: Any = None,
     turn_id: str = "",
     api_request_id: str = "",
+    parent_session_id: str = "",
+    delegate_depth: Any = None,
+    delegate_role: str = "",
+    subagent_id: str = "",
     **_: Any,
 ) -> None:
     client = _get_langfuse()
@@ -881,6 +1157,10 @@ def on_pre_llm_request(
                 client=client,
                 turn_id=turn_id,
                 api_request_id=api_request_id,
+                parent_session_id=parent_session_id,
+                delegate_depth=delegate_depth,
+                delegate_role=delegate_role,
+                subagent_id=subagent_id,
             )
             _evict_stale_locked()
             _TRACE_STATE[task_key] = state

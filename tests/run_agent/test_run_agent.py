@@ -3989,6 +3989,10 @@ class TestRunConversation:
         resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
         resp2 = _mock_response(content="Done searching", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [resp1, resp2]
+        agent._parent_session_id = "parent-session-1"
+        agent._delegate_depth = 1
+        agent._delegate_role = "leaf"
+        agent._subagent_id = "sa-0-deadbeef"
 
         hook_calls = []
 
@@ -4023,6 +4027,10 @@ class TestRunConversation:
         ]
         assert all("message_count" in c and isinstance(c.get("request_messages"), list) for c in pre_request_calls)
         assert all("request" in c and "messages" in c["request"]["body"] for c in pre_request_calls)
+        assert all(call["parent_session_id"] == "parent-session-1" for call in pre_request_calls + post_request_calls)
+        assert all(call["delegate_depth"] == 1 for call in pre_request_calls + post_request_calls)
+        assert all(call["delegate_role"] == "leaf" for call in pre_request_calls + post_request_calls)
+        assert all(call["subagent_id"] == "sa-0-deadbeef" for call in pre_request_calls + post_request_calls)
         assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
@@ -4058,6 +4066,40 @@ class TestRunConversation:
 
         assert payload_built is False
         assert hook_called is False
+
+    def test_api_request_error_hook_carries_delegation_identity(self, agent, monkeypatch):
+        self._setup_agent(agent)
+        agent._parent_session_id = "parent-session-1"
+        agent._delegate_depth = 1
+        agent._delegate_role = "leaf"
+        agent._subagent_id = "sa-0-deadbeef"
+        captured = {}
+
+        def _invoke_hook(name, **kwargs):
+            captured["name"] = name
+            captured.update(kwargs)
+            return []
+
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: name == "api_request_error")
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _invoke_hook)
+        monkeypatch.setattr(agent, "_api_request_payload_for_hook", lambda api_kwargs: {"body": api_kwargs})
+
+        agent._invoke_api_request_error_hook(
+            task_id="task-1",
+            turn_id="turn-1",
+            api_request_id="api-1",
+            api_call_count=1,
+            api_start_time=0.0,
+            api_kwargs={"messages": [{"role": "user", "content": "hi"}]},
+            error_type="RuntimeError",
+            error_message="boom",
+        )
+
+        assert captured["name"] == "api_request_error"
+        assert captured["parent_session_id"] == "parent-session-1"
+        assert captured["delegate_depth"] == 1
+        assert captured["delegate_role"] == "leaf"
+        assert captured["subagent_id"] == "sa-0-deadbeef"
 
     def test_request_scoped_api_hooks_skip_payload_work_without_listeners(self, agent, monkeypatch):
         self._setup_agent(agent)
