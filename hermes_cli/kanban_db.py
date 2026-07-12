@@ -3703,7 +3703,7 @@ def release_stale_claims(
         if (
             host_local
             and row["worker_pid"]
-            and _pid_alive(row["worker_pid"])
+            and _worker_alive(row["worker_pid"])
             and not heartbeat_stale
         ):
             new_expires = now + _resolve_claim_ttl_seconds()
@@ -6170,6 +6170,88 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
+# Windows has no waitpid()-style reaping for detached children, so without
+# extra bookkeeping every worker death is indistinguishable from a vanished
+# PID ("pid N not alive") and the exit-code protections (rate-limit requeue,
+# protocol-violation classification) are unreachable. Retain each spawned
+# worker's ``Popen`` handle here (keyed by pid) so the reap tick can
+# ``poll()`` real exit codes. Holding the process handle open has a second
+# benefit: the kernel keeps the process object (and therefore the PID)
+# reserved until the handle is released, so a retained pid can NOT be
+# recycled by an unrelated process — which is what makes handle-first
+# liveness checks immune to PID-reuse false positives.
+#
+# Exited entries are retained until their exit record ages out of
+# ``_recent_worker_exits`` (same TTL) so same-tick and next-tick liveness
+# checks can still consult the handle, then dropped. The registry is
+# per-process: a dispatcher running in a different process from the spawner
+# simply finds no entry and falls back to today's behavior.
+_windows_worker_procs: "dict[int, object]" = {}
+
+
+def _register_worker_proc(proc) -> None:
+    """Retain a spawned worker's Popen handle for exit-code capture (Windows).
+
+    No-op on POSIX (waitpid reaping already covers it) and for procs
+    without a usable pid.
+    """
+    if os.name != "nt" or proc is None:
+        return
+    pid = getattr(proc, "pid", None)
+    if not pid or pid <= 0:
+        return
+    _windows_worker_procs[int(pid)] = proc
+
+
+def _reap_windows_workers() -> "list[int]":
+    """Poll retained worker handles and record exits (Windows counterpart
+    of the POSIX ``waitpid`` loop in :func:`reap_worker_zombies`).
+
+    Returns the list of pids whose exit was newly recorded this call.
+    Exited handles are kept until their ``_recent_worker_exits`` record
+    ages out (see registry comment above), then released.
+    """
+    reaped: "list[int]" = []
+    now = time.time()
+    for pid, proc in list(_windows_worker_procs.items()):
+        try:
+            rc = proc.poll()
+        except Exception:
+            _windows_worker_procs.pop(pid, None)
+            continue
+        if rc is None:
+            continue
+        entry = _recent_worker_exits.get(pid)
+        if entry is None:
+            _record_worker_exit(pid, int(rc))
+            reaped.append(pid)
+        else:
+            _, recorded_at = entry
+            if now - recorded_at > _RECENT_WORKER_EXIT_TTL_SECONDS:
+                _windows_worker_procs.pop(pid, None)
+    return reaped
+
+
+def _worker_alive(pid: Optional[int]) -> bool:
+    """Liveness check that prefers the retained process handle on Windows.
+
+    A retained handle's ``poll()`` is authoritative: it cannot confuse a
+    dead worker with an unrelated process that recycled its PID (the open
+    handle also prevents the recycle outright). Falls back to
+    :func:`_pid_alive` when no handle is retained (POSIX, or a dispatcher
+    process that didn't spawn this worker).
+    """
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        proc = _windows_worker_procs.get(int(pid))
+        if proc is not None:
+            try:
+                return proc.poll() is None
+            except Exception:
+                pass
+    return _pid_alive(pid)
+
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status for later classification.
@@ -6219,9 +6301,32 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     for ``unknown``.
     """
     entry = _recent_worker_exits.get(int(pid))
+    if entry is None and os.name == "nt":
+        # Callers that reach classification without a reap tick first
+        # (e.g. a watcher invoking ``detect_crashed_workers`` directly)
+        # can still learn the exit code straight from the retained handle.
+        proc = _windows_worker_procs.get(int(pid))
+        if proc is not None:
+            try:
+                rc = proc.poll()
+            except Exception:
+                rc = None
+            if rc is not None:
+                _record_worker_exit(pid, int(rc))
+                entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
     raw, _ = entry
+    if os.name == "nt":
+        # On Windows the registry stores ``Popen.returncode`` directly
+        # (recorded by ``_reap_windows_workers``) — there is no waitpid
+        # raw-status encoding and no signal semantics.
+        code = int(raw)
+        if code == 0:
+            return ("clean_exit", 0)
+        if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+            return ("rate_limited", code)
+        return ("nonzero_exit", code)
     try:
         if os.WIFEXITED(raw):
             code = os.WEXITSTATUS(raw)
@@ -6241,8 +6346,15 @@ def reap_worker_zombies() -> "list[int]":
     """Reap all zombie children of this process without blocking.
 
     Returns the list of reaped PIDs. Safe to call when there are no
-    children (returns []). No-op on Windows.
+    children (returns []). On Windows there are no zombies to reap;
+    instead this polls the retained worker handles so exit codes are
+    captured (see :func:`_reap_windows_workers`).
     """
+    if os.name == "nt":
+        try:
+            return _reap_windows_workers()
+        except Exception:
+            return []
     reaped: "list[int]" = []
     if os.name != "nt":
         try:
@@ -6811,7 +6923,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 grace = _resolve_crash_grace_seconds()
                 if time.time() - started_at < grace:
                     continue
-            if _pid_alive(row["worker_pid"]):
+            if _worker_alive(row["worker_pid"]):
                 continue
 
             pid = int(row["worker_pid"])
@@ -8283,6 +8395,11 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    #
+    # On Windows the Popen handle is the ONLY way to ever learn this
+    # worker's exit code (no waitpid for detached children), so retain it
+    # for the reap tick instead of abandoning it.
+    _register_worker_proc(proc)
     return proc.pid
 
 

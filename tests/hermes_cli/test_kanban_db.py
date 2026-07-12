@@ -872,7 +872,13 @@ def test_resolve_crash_grace_seconds_handles_bad_env(monkeypatch):
 
 
 def _exited_status(code: int) -> int:
-    """Raw wait-status for a WIFEXITED child with the given exit code."""
+    """Recorded exit status for a child with the given exit code.
+
+    POSIX records the raw wait status (WIFEXITED encoding); Windows
+    records ``Popen.returncode`` directly (see ``_reap_windows_workers``).
+    """
+    if os.name == "nt":
+        return code
     return code << 8
 
 
@@ -979,6 +985,179 @@ def test_real_crash_still_counts_and_trips_breaker(kanban_home, monkeypatch):
         assert task.status == "blocked", (
             f"genuine crashes should still trip the breaker, got {task.status}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Windows exit-code capture: retained Popen handles make worker exit codes
+# visible on nt, where there is no waitpid()-style reaping. Without this,
+# every worker death is an opaque "pid N not alive" crash and the
+# rate-limit-requeue / protocol-violation protections are dead code.
+# ---------------------------------------------------------------------------
+
+_windows_only = pytest.mark.skipif(
+    os.name != "nt", reason="Windows-only exit-code capture path"
+)
+
+
+class _FakeProc:
+    """Stand-in for a spawned worker's Popen handle."""
+
+    def __init__(self, pid: int, rc=None):
+        self.pid = pid
+        self._rc = rc
+
+    def poll(self):
+        return self._rc
+
+    def exit(self, rc: int) -> None:
+        self._rc = rc
+
+
+@pytest.fixture
+def clean_worker_registry():
+    kb._windows_worker_procs.clear()
+    kb._recent_worker_exits.clear()
+    yield
+    kb._windows_worker_procs.clear()
+    kb._recent_worker_exits.clear()
+
+
+@_windows_only
+def test_windows_reap_records_real_exit_codes(clean_worker_registry):
+    running = _FakeProc(41000, rc=None)
+    rate_limited = _FakeProc(41001, rc=kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    clean = _FakeProc(41002, rc=0)
+    failed = _FakeProc(41003, rc=1)
+    for p in (running, rate_limited, clean, failed):
+        kb._register_worker_proc(p)
+
+    reaped = kb.reap_worker_zombies()
+    assert sorted(reaped) == [41001, 41002, 41003]
+
+    assert kb._classify_worker_exit(41001) == (
+        "rate_limited", kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+    )
+    assert kb._classify_worker_exit(41002) == ("clean_exit", 0)
+    assert kb._classify_worker_exit(41003) == ("nonzero_exit", 1)
+    # Still-running worker: nothing recorded, classification stays unknown.
+    assert kb._classify_worker_exit(41000) == ("unknown", None)
+
+    # A second reap does not double-record already-reaped exits.
+    assert kb.reap_worker_zombies() == []
+
+
+@_windows_only
+def test_windows_classify_falls_back_to_retained_handle(clean_worker_registry):
+    # A caller that reaches classification without a reap tick first (e.g.
+    # a watcher calling detect_crashed_workers directly) still gets the
+    # real exit code straight from the retained handle.
+    proc = _FakeProc(42000, rc=kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    kb._register_worker_proc(proc)
+    assert kb._classify_worker_exit(42000) == (
+        "rate_limited", kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+    )
+
+
+@_windows_only
+def test_windows_worker_alive_defeats_pid_reuse(
+    clean_worker_registry, monkeypatch,
+):
+    # The pid LOOKS alive (recycled by an unrelated process), but the
+    # retained handle knows the worker exited — handle wins.
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    proc = _FakeProc(43000, rc=None)
+    kb._register_worker_proc(proc)
+    assert kb._worker_alive(43000) is True
+    proc.exit(1)
+    assert kb._worker_alive(43000) is False
+    # No retained handle → fall back to the pid probe (today's behavior).
+    assert kb._worker_alive(43999) is True
+
+
+@_windows_only
+def test_windows_exited_handles_released_after_ttl(
+    clean_worker_registry, monkeypatch,
+):
+    proc = _FakeProc(44000, rc=0)
+    kb._register_worker_proc(proc)
+    kb.reap_worker_zombies()
+    assert 44000 in kb._windows_worker_procs
+
+    # Past the exit-record TTL the handle is dropped, releasing the pid.
+    real_time = time.time()
+    monkeypatch.setattr(
+        kb.time, "time",
+        lambda: real_time + kb._RECENT_WORKER_EXIT_TTL_SECONDS + 61,
+    )
+    kb.reap_worker_zombies()
+    assert 44000 not in kb._windows_worker_procs
+
+
+@_windows_only
+def test_windows_rate_limit_exit_requeues_via_detect_crashed_workers(
+    kanban_home, clean_worker_registry, monkeypatch,
+):
+    """End-to-end on nt: a registered worker that exits with the rate-limit
+    sentinel is requeued to ``ready`` without counting a failure — the
+    protection that was dead code while exit codes were invisible."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="nt-rl", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+
+        proc = _FakeProc(45000, rc=None)
+        kb._register_worker_proc(proc)
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (45000, tid),
+        )
+        conn.commit()
+
+        # Worker dies on a quota wall; the pid probe would say "not alive".
+        proc.exit(kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        kb.reap_worker_zombies()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed
+        assert tid in getattr(
+            kb.detect_crashed_workers, "_last_rate_limited", [],
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+
+
+@_windows_only
+def test_windows_protocol_violation_classified_via_handle(
+    kanban_home, clean_worker_registry, monkeypatch,
+):
+    """End-to-end on nt: a clean exit (rc=0) with the task still running is
+    classified as a protocol violation instead of an opaque crash."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="nt-pv", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+
+        proc = _FakeProc(46000, rc=0)
+        kb._register_worker_proc(proc)
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (46000, tid),
+        )
+        conn.commit()
+        kb.reap_worker_zombies()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid in crashed
+        run = conn.execute(
+            "SELECT error FROM task_runs WHERE task_id=? "
+            "ORDER BY id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        assert "protocol violation" in (run["error"] or "")
 
 
 def test_respawn_guard_defers_rate_limited_within_cooldown(
