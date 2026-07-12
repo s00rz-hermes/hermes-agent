@@ -4092,16 +4092,25 @@ def _finalize_clean_review(
             "reviewed_sha": reviewed_sha,
             "verdict": "CLEAN",
         }
-        _append_event(conn, producer.id, "review_approved", payload)
+        summary = f"Exact-SHA review CLEAN at {reviewed_sha}"
+        run_id = _synthesize_ended_run(
+            conn,
+            producer.id,
+            outcome="completed",
+            summary=summary,
+            metadata=payload,
+        )
+        _append_event(conn, producer.id, "review_approved", payload, run_id=run_id)
         _append_event(
             conn,
             producer.id,
             "completed",
             {
                 "result_len": len(producer.result) if producer.result else 0,
-                "summary": f"Exact-SHA review CLEAN at {reviewed_sha}",
+                "summary": summary,
                 "review": payload,
             },
+            run_id=run_id,
         )
     _clear_failure_counter(conn, producer.id)
     return True

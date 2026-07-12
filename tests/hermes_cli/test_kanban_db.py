@@ -3867,6 +3867,58 @@ def test_not_clean_review_routes_same_pr_remediation_and_exact_sha_rereview(
         ).fetchone()[0] == 2
 
 
+def test_clean_review_records_producer_handoff_for_downstream_child(kanban_home):
+    """Auto-closing a CLEAN-reviewed producer must preserve its handoff."""
+    pr_url = "https://github.com/acme/widgets/pull/43"
+    reviewed_sha = "e" * 40
+
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+        child = kb.create_task(conn, title="deploy after producer", assignee="deployer")
+        kb.link_tasks(conn, producer, child)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            summary="Verdict: CLEAN",
+            metadata={
+                "verdict": "CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": reviewed_sha,
+            },
+        )
+
+        assert kb.get_task(conn, producer).status == "done"
+        assert kb.get_task(conn, child).status == "ready"
+
+        runs = [run for run in kb.list_runs(conn, producer) if run.outcome == "completed"]
+        assert len(runs) == 1
+        run = runs[0]
+        assert run.summary == f"Exact-SHA review CLEAN at {reviewed_sha}"
+        assert run.metadata == {
+            "review_task_id": reviewer,
+            "pr_url": pr_url,
+            "reviewed_sha": reviewed_sha,
+            "verdict": "CLEAN",
+        }
+
+        events = kb.list_events(conn, producer)
+        routed_events = [
+            event for event in events if event.kind in {"review_approved", "completed"}
+        ]
+        assert [event.kind for event in routed_events] == ["review_approved", "completed"]
+        assert {event.run_id for event in routed_events} == {run.id}
+
+        context = kb.build_worker_context(conn, child)
+        assert "(no result recorded)" not in context
+        assert f"Exact-SHA review CLEAN at {reviewed_sha}" in context
+        assert pr_url in context
+        assert reviewed_sha in context
+
+
 def test_not_clean_review_keeps_unrelated_profile_capacity_available(
     kanban_home, all_assignees_spawnable
 ):
