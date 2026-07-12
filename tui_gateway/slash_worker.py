@@ -130,8 +130,23 @@ def main():
         parent_create_time = 0.0
     _start_parent_death_watchdog(orig_ppid, parent_create_time)
 
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        cli = HermesCLI(model=args.model or None, compact=True, resume=args.session_key, verbose=False)
+    sys.stdout.write(json.dumps({"telemetry": "initialized"}) + "\n")
+    sys.stdout.flush()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cli = HermesCLI(model=args.model or None, compact=True, resume=args.session_key, verbose=False)
+    except Exception:
+        # Never put raw bootstrap exceptions on this pre-logger control path.
+        sys.stdout.write(
+            json.dumps(
+                {"telemetry": "bootstrap_failed", "reason": "initialization_failure"}
+            )
+            + "\n"
+        )
+        sys.stdout.flush()
+        return 1
+    sys.stdout.write(json.dumps({"telemetry": "ready"}) + "\n")
+    sys.stdout.flush()
 
     for raw in sys.stdin:
         line = raw.strip()
@@ -151,6 +166,7 @@ def main():
             sys.stdout.flush()
         finally:
             _in_flight.clear()
+    return 0
 
 
 if __name__ == "__main__":

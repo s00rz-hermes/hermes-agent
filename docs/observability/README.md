@@ -5,6 +5,11 @@ need to reconstruct agent execution without changing runtime behavior. This
 contract supports trace, metrics, audit, replay, and export integrations such
 as Langfuse, OpenTelemetry-style collectors, and NeMo Relay.
 
+Native dashboard slash-worker process, queue, and command-lifecycle events use
+a narrower privacy-bounded log contract documented in
+[`dashboard-slash-worker.md`](dashboard-slash-worker.md). They intentionally do
+not duplicate observer, generic process-supervisor, or gateway delivery events.
+
 Observer hooks are intentionally backend-neutral. They expose stable lifecycle
 events, correlation IDs, sanitized payloads, timing, status, and error fields.
 They do not replace Hermes' planner, model providers, memory, tool registry,
