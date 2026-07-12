@@ -510,9 +510,11 @@ class _SlashWorker:
         self._closed = True
         proc = self.proc
         forced = False
-        self.telemetry.emit(
-            "worker_stopping", state="stopping", reason="graceful_shutdown"
-        )
+        telemetry = getattr(self, "telemetry", None)
+        if telemetry is not None:
+            telemetry.emit(
+                "worker_stopping", state="stopping", reason="graceful_shutdown"
+            )
         try:
             if proc.poll() is None:
                 proc.terminate()
@@ -531,25 +533,27 @@ class _SlashWorker:
                 proc.kill()
                 proc.wait(timeout=1)
             except Exception as exc:
-                self.telemetry.emit(
-                    "worker_shutdown_failed",
-                    state="failed",
-                    reason="shutdown_failed",
-                    summary=f"{type(exc).__name__}: {exc}",
-                )
+                if telemetry is not None:
+                    telemetry.emit(
+                        "worker_shutdown_failed",
+                        state="failed",
+                        reason="shutdown_failed",
+                        summary=f"{type(exc).__name__}: {exc}",
+                    )
         finally:
             for stream in (proc.stdin, proc.stdout, proc.stderr):
                 try:
                     stream.close()
                 except Exception:
                     pass
-            self.telemetry.emit(
-                "worker_stopped",
-                state="stopped",
-                reason="forced_shutdown" if forced else "graceful_shutdown",
-                exit_code=proc.poll(),
-            )
-            self.telemetry.flush_suppressed()
+            if telemetry is not None:
+                telemetry.emit(
+                    "worker_stopped",
+                    state="stopped",
+                    reason="forced_shutdown" if forced else "graceful_shutdown",
+                    exit_code=proc.poll(),
+                )
+                telemetry.flush_suppressed()
 
 
 def _load_busy_input_mode() -> str:
@@ -2736,7 +2740,9 @@ def _restart_slash_worker(sid: str, session: dict):
             session["session_key"],
             getattr(session.get("agent"), "model", _resolve_model()),
         )
-        new_worker.telemetry.record_restart_attempt()
+        telemetry = getattr(new_worker, "telemetry", None)
+        if telemetry is not None:
+            telemetry.record_restart_attempt()
     except Exception:
         session["slash_worker"] = None
         return
