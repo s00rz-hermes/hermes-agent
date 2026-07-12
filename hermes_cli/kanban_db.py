@@ -4108,6 +4108,52 @@ def _format_review_findings(metadata: dict) -> str:
     return rendered[:6000]
 
 
+def _rereview_replacement_sha(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    pr_url: str,
+) -> tuple[bool, Optional[str]]:
+    """Return the persisted replacement SHA required by a dependent re-review.
+
+    The router-generated re-review body explicitly requires ``replacement_sha``.
+    Treat such a card as bound to its completed remediation parent, and fail
+    closed when that parent or its structured handoff is missing, malformed, or
+    for a different PR. Ordinary first-pass reviews have no such binding.
+    """
+    parent_rows = conn.execute(
+        "SELECT p.* FROM tasks p "
+        "JOIN task_links l ON l.parent_id = p.id "
+        "WHERE l.child_id = ? AND p.status = 'done'",
+        (review_task_id,),
+    ).fetchall()
+    remediation_parents = [
+        row for row in parent_rows
+        if "replacement_sha" in ((row["title"] or "") + "\\n" + (row["body"] or ""))
+    ]
+    if not remediation_parents:
+        return False, None
+    if len(remediation_parents) != 1:
+        return True, None
+
+    parent_id = remediation_parents[0]["id"]
+    completed_runs = [
+        run for run in list_runs(conn, parent_id, include_active=False)
+        if run.outcome == "completed"
+    ]
+    if not completed_runs:
+        return True, None
+    handoff = completed_runs[-1].metadata
+    if not isinstance(handoff, dict) or _review_pr_url(handoff) != pr_url:
+        return True, None
+    replacement_sha = handoff.get("replacement_sha")
+    if not isinstance(replacement_sha, str):
+        return True, None
+    replacement_sha = replacement_sha.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", replacement_sha):
+        return True, None
+    return True, replacement_sha
+
+
 def _finalize_clean_review(
     conn: sqlite3.Connection,
     producer: Task,
@@ -4188,6 +4234,14 @@ def _route_review_completion(
         return False
     review_task = get_task(conn, review_task_id)
     if review_task is None:
+        return False
+    binding_required, expected_replacement_sha = _rereview_replacement_sha(
+        conn, review_task_id, pr_url
+    )
+    if binding_required and (
+        expected_replacement_sha is None
+        or reviewed_sha != expected_replacement_sha
+    ):
         return False
     producers = _review_producers(conn, review_task_id, pr_url)
     if not producers:
@@ -4470,7 +4524,18 @@ def complete_task(
                     task_id,
                     "review_routing_deferred",
                     {
+                        "review_task_id": task_id,
                         "verdict": verdict,
+                        "pr_url": (
+                            _review_pr_url(metadata)
+                            if isinstance(metadata, dict)
+                            else None
+                        ),
+                        "reviewed_sha": (
+                            _reviewed_sha(metadata)
+                            if isinstance(metadata, dict)
+                            else None
+                        ),
                         "reason": (
                             "route_failed"
                             if route_failed
