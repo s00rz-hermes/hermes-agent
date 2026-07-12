@@ -259,6 +259,7 @@ AUTHOR_MAP = {
     "dbeyer7@gmail.com": "benegessarit",
     "264773240+MrDiamondBallz@users.noreply.github.com": "MrDiamondBallz",
     "claudlos@agentmail.to": "claudlos",  # PR #52351 salvage (cron base_url exfil guard; #<salvagePR>)
+    "hermes-agent@users.noreply.github.com": "s00rz",  # PR #4 fork-local agent-authored Kanban review routing remediation
     "94890352+Adolanium@users.noreply.github.com": "Adolanium",
     "kenmege@yahoo.com": "Kenmege",
     "tianying.x@eukarya.io": "xtymac",

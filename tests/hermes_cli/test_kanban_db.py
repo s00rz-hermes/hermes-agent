@@ -3934,6 +3934,31 @@ def test_not_clean_review_without_exact_sha_fails_safe_in_todo(kanban_home):
         assert deferred[0].payload["verdict"] == "NOT CLEAN"
 
 
+def test_not_clean_review_without_parseable_verdict_fails_safe_in_todo(kanban_home):
+    """Unstructured review evidence must not promote a PR producer into active_pr."""
+    pr_url = "https://github.com/acme/widgets/pull/10"
+    reviewed_sha = "d" * 40
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            summary="Verdict: NOT CLEAN",
+            metadata={"pr_url": pr_url, "reviewed_sha": reviewed_sha},
+        )
+
+        assert kb.get_task(conn, producer).status == "todo"
+        events = kb.list_events(conn, reviewer)
+        deferred = [event for event in events if event.kind == "review_routing_deferred"]
+        assert len(deferred) == 1
+        assert deferred[0].payload["verdict"] is None
+        assert deferred[0].payload["reason"] == "missing_or_unparseable_verdict"
+
+
 def test_claim_review_task_transitions_to_running(kanban_home):
     """claim_review_task atomically transitions review -> running."""
     with kb.connect() as conn:

@@ -4388,14 +4388,14 @@ def complete_task(
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
-    # Route structured review outcomes before dependency promotion. On NOT
-    # CLEAN the dependent re-review becomes an unfinished parent of the PR
-    # producer, so that producer never enters ``ready`` and cannot be trapped
-    # by the ``active_pr`` respawn guard. Missing/invalid exact-SHA metadata or
-    # a routing failure fails safe: leave the producer in ``todo`` and emit one
+    # Route review outcomes before dependency promotion. On NOT CLEAN the
+    # dependent re-review becomes an unfinished parent of the PR producer, so
+    # that producer never enters ``ready`` and cannot be trapped by the
+    # ``active_pr`` respawn guard. Incomplete/unstructured review evidence or a
+    # routing failure fails safe: leave the producer in ``todo`` and emit one
     # durable diagnostic instead of promoting it into a guard/event storm.
     verdict = _review_verdict(metadata)
-    review_route_required = bool(verdict) and _has_pr_producer_child(conn, task_id)
+    review_route_required = _has_pr_producer_child(conn, task_id)
     review_routed = False
     route_failed = False
     if review_route_required:
@@ -4412,7 +4412,13 @@ def complete_task(
                     "review_routing_deferred",
                     {
                         "verdict": verdict,
-                        "reason": "route_failed" if route_failed else "missing_or_mismatched_review_evidence",
+                        "reason": (
+                            "route_failed"
+                            if route_failed
+                            else "missing_or_unparseable_verdict"
+                            if verdict is None
+                            else "missing_or_mismatched_review_evidence"
+                        ),
                     },
                 )
     if not review_route_required or review_routed:
