@@ -2389,6 +2389,71 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+# Roster cache for skill validation at card-authoring time. Keyed by the
+# profile home; entries expire quickly so freshly-installed skills are
+# picked up within a tick.
+_SKILL_ROSTER_CACHE_TTL_SECONDS = 60
+_skill_roster_cache: "dict[str, tuple[float, frozenset[str]]]" = {}
+
+
+def _assignee_skill_roster(assignee: Optional[str]) -> Optional[frozenset]:
+    """Best-effort set of skill names installed for ``assignee``'s profile.
+
+    Skill names are the directory names containing a ``SKILL.md`` under
+    ``<profile HERMES_HOME>/skills/``. Returns ``None`` when the roster
+    cannot be determined (unknown profile, no skills tree, resolver
+    error) — callers MUST treat ``None`` as "skip validation", never as
+    "no skills allowed".
+    """
+    if not assignee:
+        return None
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+        home = resolve_profile_env(str(assignee))
+    except Exception:
+        return None
+    cached = _skill_roster_cache.get(home)
+    now = time.time()
+    if cached is not None and now - cached[0] < _SKILL_ROSTER_CACHE_TTL_SECONDS:
+        return cached[1]
+    skills_dir = Path(home) / "skills"
+    if not skills_dir.is_dir():
+        return None
+    try:
+        names = frozenset(
+            md.parent.name for md in skills_dir.rglob("SKILL.md")
+        )
+    except Exception:
+        return None
+    if not names:
+        return None
+    _skill_roster_cache[home] = (now, names)
+    return names
+
+
+def validate_skills_for_assignee(
+    assignee: Optional[str], skills: "list[str]",
+) -> "tuple[list[str], list[str]]":
+    """Split ``skills`` into (available, missing) for ``assignee``'s roster.
+
+    Conservative: when the roster is unknown (see
+    :func:`_assignee_skill_roster`) everything is treated as available.
+    Disable entirely with ``HERMES_KANBAN_SKILL_VALIDATION=0``.
+    """
+    if not skills:
+        return list(skills), []
+    if os.environ.get(
+        "HERMES_KANBAN_SKILL_VALIDATION", "",
+    ).strip().lower() in ("0", "false", "no", "off"):
+        return list(skills), []
+    roster = _assignee_skill_roster(assignee)
+    if roster is None:
+        return list(skills), []
+    kept = [s for s in skills if s in roster]
+    missing = [s for s in skills if s not in roster]
+    return kept, missing
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2542,6 +2607,19 @@ def create_task(
             )
         skills_list = cleaned
 
+    # Validate against the assignee's installed skill roster at AUTHORING
+    # time. A card whose entire skill list is unknown for its assignee
+    # spawn-kills the worker at argparse (cli.py hard-fails when every
+    # requested skill is missing), which on repeat trips the breaker —
+    # 37 worker deaths on this failure shape before validation existed.
+    # Unknown names are stripped (recorded on the ``created`` event) so a
+    # decomposer typo degrades to a warning instead of a doomed spawn.
+    stripped_skills: list[str] = []
+    if skills_list:
+        skills_list, stripped_skills = validate_skills_for_assignee(
+            assignee, skills_list,
+        )
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -2683,6 +2761,9 @@ def create_task(
                         "tenant": tenant,
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
+                        "skills_stripped": (
+                            list(stripped_skills) if stripped_skills else None
+                        ),
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )

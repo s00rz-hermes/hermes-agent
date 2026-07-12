@@ -980,8 +980,15 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
       for these rows and posts the completion message into the running
       session.
 
-    - **CLI / cron / test / unattached**: no persistent delivery channel,
-      no-op.
+    - **CLI / cron / test / unattached** (this includes dispatcher- and
+      decomposer-created cards): no per-session delivery channel. Falls
+      back to the configured operator channel
+      (``kanban.operator_channel: "platform:chat_id[:thread_id]"`` in
+      config.yaml, delivered via ``kanban.operator_notifier_profile``,
+      default profile ``default``) so automation-created cards are not
+      born silent — before this fallback, 41 of 43 blocked cards on the
+      2026-07-11 board had no subscription at all. No-op when the
+      operator channel is not configured.
 
     Failure mode: any exception inside the function is logged at WARNING
     with the offending exception + diagnostic env vars and swallowed.
@@ -1022,7 +1029,10 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 or os.environ.get("HERMES_SESSION_KEY", "")
             )
             if not session_key:
-                return False  # CLI / cron / test — no persistent channel
+                # CLI / cron / dispatcher / decomposer — no per-session
+                # channel. Fall back to the configured operator channel
+                # so automation-created cards aren't born silent.
+                return _subscribe_operator_channel(conn, task_id)
             platform = "tui"
             chat_id = session_key
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
@@ -1045,6 +1055,68 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         logger.warning(
             "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
             _exc, platform, bool(chat_id),
+        )
+        return False
+
+
+def _operator_channel_from_config():
+    """Parse ``kanban.operator_channel`` from config.yaml.
+
+    Format: ``"platform:chat_id"`` or ``"platform:chat_id:thread_id"``
+    (e.g. ``"telegram:8899043467"``). Returns
+    ``(platform, chat_id, thread_id, notifier_profile)`` or ``None`` when
+    unset/malformed. ``notifier_profile`` comes from
+    ``kanban.operator_notifier_profile`` and defaults to ``"default"`` —
+    it must name a profile with a connected messaging adapter or the
+    poller can never deliver (subscriptions stamped with adapter-less
+    worker profiles are silently dead).
+    """
+    try:
+        cfg = load_config()
+        raw = str(
+            cfg_get(cfg, "kanban", "operator_channel", default="") or ""
+        ).strip()
+        if not raw:
+            return None
+        parts = raw.split(":")
+        if len(parts) < 2 or not parts[0].strip() or not parts[1].strip():
+            return None
+        platform = parts[0].strip()
+        chat_id = parts[1].strip()
+        thread_id = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
+        notifier_profile = str(
+            cfg_get(cfg, "kanban", "operator_notifier_profile", default="")
+            or ""
+        ).strip() or "default"
+        return platform, chat_id, thread_id, notifier_profile
+    except Exception:
+        return None
+
+
+def _subscribe_operator_channel(conn: Any, task_id: str) -> bool:
+    """Subscribe the configured operator channel to ``task_id`` events.
+
+    Fallback used by :func:`_maybe_auto_subscribe` when the creating
+    context has no delivery channel of its own. Best-effort: returns
+    False when no operator channel is configured or the write fails.
+    """
+    channel = _operator_channel_from_config()
+    if channel is None:
+        return False
+    platform, chat_id, thread_id, notifier_profile = channel
+    try:
+        from hermes_cli import kanban_db as _kb
+        _kb.add_notify_sub(
+            conn, task_id=task_id,
+            platform=platform, chat_id=chat_id,
+            thread_id=thread_id, user_id=None,
+            notifier_profile=notifier_profile,
+        )
+        return True
+    except Exception as _exc:
+        logger.warning(
+            "operator-channel auto-subscribe failed for %s: %r",
+            task_id, _exc,
         )
         return False
 

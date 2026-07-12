@@ -5732,3 +5732,72 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+# ---------------------------------------------------------------------------
+# Skill validation at card-authoring time: unknown skills are stripped
+# against the assignee's installed roster so a bad skill list can't
+# spawn-kill a worker at argparse (37 deterministic worker deaths on the
+# 2026-07-11 board traced to this).
+# ---------------------------------------------------------------------------
+
+
+def _install_skill(home, profile, category, name):
+    d = home / "profiles" / profile / "skills" / category / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
+
+
+def test_create_task_strips_unknown_skills_for_assignee(kanban_home):
+    import json
+
+    kb._skill_roster_cache.clear()
+    _install_skill(kanban_home, "tester", "devops", "skill-a")
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="s", assignee="tester",
+            skills=["skill-a", "ghost-skill"],
+        )
+        task = kb.get_task(conn, tid)
+        assert task.skills == ["skill-a"]
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='created'",
+            (tid,),
+        ).fetchone()
+        payload = json.loads(ev["payload"])
+        assert payload["skills_stripped"] == ["ghost-skill"]
+
+
+def test_create_task_all_unknown_skills_degrades_to_no_skills(kanban_home):
+    kb._skill_roster_cache.clear()
+    _install_skill(kanban_home, "tester2", "devops", "real-skill")
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="s", assignee="tester2",
+            skills=["ghost-a", "ghost-b"],
+        )
+        # Better a worker without force-loaded skills than a worker that
+        # dies at argparse and breaker-blocks the card.
+        assert kb.get_task(conn, tid).skills in (None, [])
+
+
+def test_create_task_keeps_skills_when_roster_unknown(kanban_home):
+    kb._skill_roster_cache.clear()
+    with kb.connect() as conn:
+        # Assignee has no profile dir at all — validation must not guess.
+        tid = kb.create_task(
+            conn, title="s", assignee="no-such-profile",
+            skills=["anything"],
+        )
+        assert kb.get_task(conn, tid).skills == ["anything"]
+
+
+def test_skill_validation_kill_switch(kanban_home, monkeypatch):
+    kb._skill_roster_cache.clear()
+    _install_skill(kanban_home, "tester3", "devops", "skill-a")
+    monkeypatch.setenv("HERMES_KANBAN_SKILL_VALIDATION", "0")
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="s", assignee="tester3",
+            skills=["ghost-skill"],
+        )
+        assert kb.get_task(conn, tid).skills == ["ghost-skill"]
+
