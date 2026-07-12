@@ -1160,6 +1160,248 @@ def test_windows_protocol_violation_classified_via_handle(
         assert "protocol violation" in (run["error"] or "")
 
 
+# ---------------------------------------------------------------------------
+# Breaker override-limit persistence: a systemic/protocol trip at
+# failure_limit=1 must not be re-promoted by recompute_ready (which only
+# knows the config limit) in the same tick. Regression for the 2026-07-11
+# cascade where every "protected" card burned a second doomed spawn.
+# ---------------------------------------------------------------------------
+
+
+def test_override_trip_persists_limit_and_blocks_repromotion(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="systemic", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET status='ready' WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        tripped = _kb._record_task_failure(
+            conn, tid,
+            error="pid 123 not alive",
+            outcome="crashed",
+            failure_limit=1,          # systemic fast-path override
+            persist_limit=True,
+        )
+        assert tripped is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 1
+        # The override limit is stamped so all later readers agree.
+        assert task.max_retries == 1
+
+        # The bug: recompute_ready with the CONFIG limit (2) used to see
+        # cf=1 < 2 and re-promote the card the same tick.
+        promoted = kb.recompute_ready(conn, failure_limit=2)
+        assert promoted == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_normal_trip_does_not_stamp_max_retries(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="normal", assignee="a")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        conn.commit()
+        for _ in range(2):
+            _kb._record_task_failure(
+                conn, tid,
+                error="boom", outcome="crashed", failure_limit=2,
+            )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 2
+        assert task.max_retries is None  # config-limit trips leave it alone
+
+
+def test_existing_task_max_retries_not_overwritten_by_override_trip(
+    kanban_home,
+):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="pinned", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET status='ready', max_retries=5, "
+            "consecutive_failures=4 WHERE id=?", (tid,),
+        )
+        conn.commit()
+        _kb._record_task_failure(
+            conn, tid,
+            error="boom", outcome="crashed", failure_limit=1,
+            persist_limit=True,
+        )
+        # Per-task max_retries already won resolution; it must not be
+        # clobbered by the override stamp.
+        assert kb.get_task(conn, tid).max_retries == 5
+
+
+# ---------------------------------------------------------------------------
+# Global quota-wall brake
+# ---------------------------------------------------------------------------
+
+
+def test_rate_limit_wall_roundtrip_and_extend_only(kanban_home):
+    with kb.connect() as conn:
+        assert kb.get_rate_limit_wall(conn) is None
+        until = kb.set_rate_limit_wall(conn, source="test")
+        assert until > time.time()
+        assert kb.get_rate_limit_wall(conn) == pytest.approx(until, abs=1)
+
+        # Walls only extend — an earlier resets_at is ignored.
+        sooner = time.time() + 30
+        kept = kb.set_rate_limit_wall(conn, resets_at=sooner, source="t2")
+        assert kept == pytest.approx(until, abs=1)
+
+        later = time.time() + 900
+        extended = kb.set_rate_limit_wall(conn, resets_at=later, source="t3")
+        assert extended == pytest.approx(later, abs=1)
+
+        # A garbled far-future resets_at is capped.
+        capped = kb.set_rate_limit_wall(
+            conn, resets_at=time.time() + 999999, source="t4",
+        )
+        assert capped <= time.time() + kb.RATE_LIMIT_WALL_CAP_SECONDS + 1
+
+
+def test_expired_rate_limit_wall_reads_as_clear(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        kb.set_rate_limit_wall(conn, resets_at=time.time() + 60)
+        real_time = time.time
+        monkeypatch.setattr(kb.time, "time", lambda: real_time() + 120)
+        assert kb.get_rate_limit_wall(conn) is None
+
+
+def test_dispatch_skips_all_spawns_while_wall_active(kanban_home, monkeypatch):
+    import hermes_cli.profiles as _profiles
+
+    monkeypatch.setattr(_profiles, "profile_exists", lambda _name: True)
+    spawned = []
+
+    def _stub_spawn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 12345
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="doomed", assignee="a")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        conn.commit()
+
+        kb.set_rate_limit_wall(conn, resets_at=time.time() + 300)
+        result = kb.dispatch_once(conn, spawn_fn=_stub_spawn)
+        assert result.rate_limit_wall_until is not None
+        assert spawned == []
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # Clear the wall → the same card spawns normally.
+        conn.execute(
+            "DELETE FROM kanban_meta WHERE key=?",
+            (kb.RATE_LIMIT_WALL_META_KEY,),
+        )
+        conn.commit()
+        result = kb.dispatch_once(conn, spawn_fn=_stub_spawn)
+        assert result.rate_limit_wall_until is None
+        assert spawned == [tid]
+
+
+def test_rate_limited_exit_records_global_wall(kanban_home, monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="wall", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (77000, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(
+            77000, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        )
+        kb.detect_crashed_workers(conn)
+        assert kb.get_rate_limit_wall(conn) is not None
+
+
+def test_worker_side_wall_drop_uses_env_pinned_db(kanban_home, monkeypatch):
+    # Workers inherit HERMES_KANBAN_DB from the dispatcher; the wall they
+    # drop must land in that DB.
+    monkeypatch.setenv(
+        "HERMES_KANBAN_DB", str(kb.kanban_db_path()),
+    )
+    until = kb.record_rate_limit_wall_for_worker(
+        "usage_limit_reached resets_at=%d" % int(time.time() + 1200),
+    )
+    assert until is not None
+    with kb.connect() as conn:
+        assert kb.get_rate_limit_wall(conn) == pytest.approx(until, abs=1)
+
+
+# ---------------------------------------------------------------------------
+# Crash backoff
+# ---------------------------------------------------------------------------
+
+
+def test_crash_backoff_defers_respawn_then_releases(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="backoff", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (78000, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(78000, _exited_status(1))
+        kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1
+
+        # Fresh crash → deferred by the exponential backoff.
+        assert kb.check_respawn_guard(conn, tid) == "crash_backoff"
+
+        # Once the delay elapses the guard releases.
+        base = _kb._resolve_crash_backoff_base_seconds()
+        real_time = time.time
+        monkeypatch.setattr(
+            _kb.time, "time", lambda: real_time() + base + 1,
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_crash_backoff_disabled_via_env(kanban_home, monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_BACKOFF_BASE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="nobackoff", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (79000, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(79000, _exited_status(1))
+        kb.detect_crashed_workers(conn)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,
 ):

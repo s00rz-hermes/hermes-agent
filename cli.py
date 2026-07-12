@@ -16240,6 +16240,21 @@ def main(
                                     _exit_code = _RL_CODE
                                 except Exception:
                                     _exit_code = 1
+                                # Drop the board-wide quota-wall sentinel
+                                # BEFORE exiting: on hosts where the
+                                # dispatcher can't see exit codes (Windows
+                                # without handle capture) this row is the
+                                # only signal that stops it from spawning
+                                # more workers into the same wall.
+                                try:
+                                    from hermes_cli.kanban_db import (
+                                        record_rate_limit_wall_for_worker,
+                                    )
+                                    record_rate_limit_wall_for_worker(
+                                        str(result.get("error") or "")
+                                    )
+                                except Exception:
+                                    pass
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
