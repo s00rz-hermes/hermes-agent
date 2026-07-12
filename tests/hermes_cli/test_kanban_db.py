@@ -4151,6 +4151,46 @@ def test_deferred_review_routing_stays_gated_after_dispatch_recompute(
         assert (producer, "active_pr") not in result.respawn_guarded
 
 
+def test_deferred_review_routing_stays_gated_after_reviewer_archive(
+    kanban_home, all_assignees_spawnable
+):
+    """Archiving a deferred reviewer must not reactivate its PR producer."""
+    pr_url = "https://github.com/acme/widgets/pull/11"
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append(task.id)
+        return 1234
+
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            metadata={"verdict": "NOT CLEAN", "pr_url": pr_url},
+        )
+        assert kb.get_task(conn, producer).status == "todo"
+        assert any(
+            event.kind == "review_routing_deferred"
+            for event in kb.list_events(conn, reviewer)
+        )
+
+        assert kb.archive_task(conn, reviewer)
+        assert kb.get_task(conn, reviewer).status == "archived"
+        assert kb.get_task(conn, producer).status == "todo"
+
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+        assert result.promoted == 0
+        assert kb.get_task(conn, producer).status == "todo"
+        assert producer not in spawned
+        assert (producer, "active_pr") not in result.respawn_guarded
+
+
 def test_not_clean_review_without_parseable_verdict_fails_safe_in_todo(kanban_home):
     """Unstructured review evidence must not promote a PR producer into active_pr."""
     pr_url = "https://github.com/acme/widgets/pull/10"

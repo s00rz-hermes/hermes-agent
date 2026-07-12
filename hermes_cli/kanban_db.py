@@ -3284,13 +3284,14 @@ def _has_deferred_review_routing_gate(conn: sqlite3.Connection, task_id: str) ->
     ``complete_task`` records ``review_routing_deferred`` on the review parent
     when a PR-bearing review lacks structured exact-SHA evidence (or routing
     fails). That event must be a durable dependency gate: a later dispatcher
-    recompute sees the review parent as ``done``, but the producer must not be
-    promoted back to ``ready`` and trapped by the active-PR respawn guard.
+    recompute sees the review parent as ``done`` or ``archived``, but the
+    producer must not be promoted back to ``ready`` and trapped by the
+    active-PR respawn guard.
     """
     row = conn.execute(
         "SELECT 1 FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? AND p.status = 'done' "
+        "WHERE l.child_id = ? AND p.status IN ('done', 'archived') "
         "AND EXISTS ("
         "    SELECT 1 FROM task_events e "
         "    WHERE e.task_id = p.id AND e.kind = 'review_routing_deferred'"
@@ -3322,10 +3323,10 @@ def recompute_ready(
        counter would reset on every recovery cycle and the circuit
        breaker could never trip (#35072).
 
-    3. A PR producer is gated by a completed review parent whose routing was
-       deferred because exact-SHA evidence was missing or unparseable. Those
-       stay inert until a remediation / re-review parent or exact-SHA review
-       provides a durable route.
+    3. A PR producer is gated by a completed or archived review parent whose
+       routing was deferred because exact-SHA evidence was missing or
+       unparseable. Those stay inert until a remediation / re-review parent or
+       exact-SHA review provides a durable route.
 
     The effective failure limit resolves in the same order as the
     circuit breaker in ``_record_task_failure`` so the two never
