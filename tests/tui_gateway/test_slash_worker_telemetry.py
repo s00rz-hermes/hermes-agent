@@ -119,6 +119,17 @@ def test_duplicate_burst_and_cardinality_suppression_are_counted_and_fail_safe()
     )
     assert broken.emit("worker_ready", state="ready", reason="child_ready") is None
 
+    broken_clock = SlashTelemetry(
+        lines.append,
+        session_key="session-a",
+        profile_home="profile-a",
+        parent_pid=42,
+        launcher="python",
+        instance_seed="instance-c",
+        clock=lambda: (_ for _ in ()).throw(RuntimeError("clock failed")),
+    )
+    assert broken_clock.emit("worker_ready", state="ready", reason="child_ready") is None
+
 
 def test_parent_worker_emits_receipt_dispatch_completion_and_graceful_shutdown(monkeypatch):
     from tui_gateway import server

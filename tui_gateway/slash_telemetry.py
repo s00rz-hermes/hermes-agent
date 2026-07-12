@@ -210,6 +210,33 @@ class SlashTelemetry:
         _bypass_limits: bool = False,
         **fields: Any,
     ) -> dict[str, Any] | None:
+        """Fail-open boundary: telemetry must never affect worker behavior."""
+        try:
+            return self._emit(
+                event,
+                state=state,
+                reason=reason,
+                command=command,
+                summary=summary,
+                dedup_key=dedup_key,
+                _bypass_limits=_bypass_limits,
+                **fields,
+            )
+        except Exception:
+            return None
+
+    def _emit(
+        self,
+        event: str,
+        *,
+        state: str,
+        reason: str,
+        command: Any = None,
+        summary: Any = None,
+        dedup_key: Any = None,
+        _bypass_limits: bool = False,
+        **fields: Any,
+    ) -> dict[str, Any] | None:
         now = self._clock()
         if not _bypass_limits:
             while self._burst and now - self._burst[0] >= 60.0:
