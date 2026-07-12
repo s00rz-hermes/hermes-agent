@@ -334,6 +334,45 @@ def test_patch_block_then_unblock(client):
     assert r.json()["task"]["status"] == "ready"
 
 
+def test_blocked_task_detail_explains_the_current_block(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "needs a decision"}
+    ).json()["task"]
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "blocked",
+            "block_reason": "Choose the production credential scope.",
+            "block_kind": "needs_input",
+        },
+    )
+    assert response.status_code == 200
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+    context = detail["blocked_context"]
+
+    assert context == {
+        "reason": "Choose the production credential scope.",
+        "kind": "needs_input",
+        "source": "blocked",
+        "occurred_at": context["occurred_at"],
+        "run_id": context["run_id"],
+        "recurrences": 1,
+    }
+    assert isinstance(context["occurred_at"], int)
+    assert isinstance(context["run_id"], int)
+
+
+def test_nonblocked_task_detail_has_no_blocked_context(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "ready to work"}
+    ).json()["task"]
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+
+    assert detail["blocked_context"] is None
+
+
 def test_patch_schedule_then_unblock(client):
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
     r = client.patch(
@@ -2265,3 +2304,16 @@ def test_dashboard_failed_card_highlight_class_exists():
     assert "hermes-kanban-card--failed" in js
     assert "hermes-kanban-card--failed" in css
     assert "failedIds" in js
+
+
+def test_blocked_drawer_leads_with_a_user_focused_reason_panel():
+    repo_root = Path(__file__).resolve().parents[2]
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    css = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+
+    assert "function BlockedReasonSection" in dist
+    assert "props.data.blocked_context" in dist
+    assert '"Why this task is blocked"' in dist
+    assert '"What you can do"' in dist
+    assert "hermes-kanban-blocked-reason" in css
+    assert dist.index("h(BlockedReasonSection") < dist.index("h(StatusActions")

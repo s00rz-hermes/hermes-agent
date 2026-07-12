@@ -187,6 +187,39 @@ def _event_dict(event: kanban_db.Event) -> dict[str, Any]:
     }
 
 
+def _blocked_context(task: kanban_db.Task, events: list[kanban_db.Event]) -> Optional[dict[str, Any]]:
+    """Return the latest user-readable explanation for a blocked task."""
+    if task.status != "blocked":
+        return None
+
+    for event in reversed(events):
+        if event.kind not in {"blocked", "gave_up", "crashed", "timed_out", "spawn_failed"}:
+            continue
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        reason = payload.get("reason") or payload.get("error") or task.last_failure_error
+        if not reason:
+            continue
+        return {
+            "reason": str(reason),
+            "kind": payload.get("kind") or task.block_kind,
+            "source": event.kind,
+            "occurred_at": event.created_at,
+            "run_id": event.run_id,
+            "recurrences": payload.get("recurrences", task.block_recurrences),
+        }
+
+    if task.last_failure_error:
+        return {
+            "reason": task.last_failure_error,
+            "kind": task.block_kind,
+            "source": "task",
+            "occurred_at": None,
+            "run_id": task.current_run_id,
+            "recurrences": task.block_recurrences,
+        }
+    return None
+
+
 def _comment_dict(c: kanban_db.Comment) -> dict[str, Any]:
     return {
         "id": c.id,
@@ -553,10 +586,12 @@ def get_task(
         if diag_list:
             task_d["diagnostics"] = diag_list
             task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
+        task_events = kanban_db.list_events(conn, task_id)
         return {
             "task": task_d,
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
-            "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
+            "events": [_event_dict(e) for e in task_events],
+            "blocked_context": _blocked_context(task, task_events),
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": _links_for(conn, task_id),
             "runs": [
@@ -811,6 +846,7 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    block_kind: Optional[str] = None
     # Structured handoff fields — forwarded to complete_task when status
     # transitions to 'done'. Dashboard parity with ``hermes kanban
     # complete --summary ... --metadata ...``.
@@ -850,7 +886,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     metadata=payload.metadata,
                 )
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                ok = kanban_db.block_task(
+                    conn, task_id, reason=payload.block_reason, kind=payload.block_kind,
+                )
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
             elif s == "ready":

@@ -3315,6 +3315,59 @@
     );
   }
 
+  function BlockedReasonSection(props) {
+    const { t } = useI18n();
+    const task = props.task;
+    if (!task || task.status !== "blocked") return null;
+
+    const context = props.context || null;
+    const kind = (context && context.kind) || task.block_kind || null;
+    const source = context && context.source;
+    const reason = (context && context.reason)
+      || task.last_failure_error
+      || tx(t, "noBlockReasonRecorded", "No reason was recorded. Check the latest event and run below for details.");
+    const isExecutionFailure = ["gave_up", "crashed", "timed_out", "spawn_failed"].includes(source);
+    let nextStep = tx(t, "blockedNextStepDefault", "Resolve the issue described above, then use Unblock to return this task to the runnable queue.");
+    if (kind === "needs_input") {
+      nextStep = tx(t, "blockedNextStepInput", "Provide the missing decision or input, then use Unblock to continue.");
+    } else if (kind === "capability") {
+      nextStep = tx(t, "blockedNextStepCapability", "Restore the required tool, access, or capability, then use Unblock to retry.");
+    } else if (kind === "transient") {
+      nextStep = tx(t, "blockedNextStepTransient", "Confirm the temporary condition has cleared, then use Unblock to retry.");
+    } else if (isExecutionFailure) {
+      nextStep = tx(t, "blockedNextStepFailure", "Review the latest run and worker log below, fix the failure, then use Unblock to retry.");
+    }
+
+    const detailBits = [];
+    if (kind) detailBits.push(kind.replace(/_/g, " "));
+    if (source && source !== "blocked") detailBits.push(source.replace(/_/g, " "));
+    if (context && context.occurred_at && timeAgo) detailBits.push(timeAgo(context.occurred_at));
+    if (context && context.recurrences > 1) {
+      detailBits.push(`${context.recurrences}× recurring`);
+    }
+
+    return h("section", {
+      className: "hermes-kanban-blocked-reason",
+      "aria-labelledby": `blocked-reason-${task.id}`,
+    },
+      h("div", { className: "hermes-kanban-blocked-reason-head" },
+        h("span", { className: "hermes-kanban-blocked-reason-icon", "aria-hidden": "true" }, "!"),
+        h("div", null,
+          h("h3", { id: `blocked-reason-${task.id}` },
+            tx(t, "whyBlocked", "Why this task is blocked")),
+          detailBits.length
+            ? h("div", { className: "hermes-kanban-blocked-reason-meta" }, detailBits.join(" · "))
+            : null,
+        ),
+      ),
+      h("p", { className: "hermes-kanban-blocked-reason-text" }, reason),
+      h("div", { className: "hermes-kanban-blocked-next" },
+        h("strong", null, tx(t, "whatYouCanDo", "What you can do")),
+        h("span", null, nextStep),
+      ),
+    );
+  }
+
   function TaskDetail(props) {
     const { t: i18n } = useI18n();
     const t = props.data.task;
@@ -3361,6 +3414,10 @@
         }) : null,
         t.created_by ? h(MetaRow, { label: tx(i18n, "createdBy", "Created by"), value: t.created_by }) : null,
       ),
+      h(BlockedReasonSection, {
+        task: t,
+        context: props.data.blocked_context,
+      }),
       h(StatusActions, {
         task: t,
         onPatch: props.onPatch,

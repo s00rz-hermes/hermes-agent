@@ -1590,3 +1590,69 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+.hermes-kanban-blocked-reason {
+  margin: 0.9rem 0;
+  padding: 0.9rem;
+  border: 1px solid color-mix(in srgb, var(--color-destructive, #d14a4a) 55%, var(--color-border));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--color-destructive, #d14a4a) 8%, var(--color-card));
+}
+
+.hermes-kanban-blocked-reason-head {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.hermes-kanban-blocked-reason-head h3 {
+  margin: 0;
+  color: var(--color-foreground);
+  font-size: 0.9rem;
+  font-weight: 650;
+}
+
+.hermes-kanban-blocked-reason-icon {
+  display: grid;
+  place-items: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--color-destructive, #d14a4a);
+  color: white;
+  font-weight: 800;
+}
+
+.hermes-kanban-blocked-reason-meta {
+  margin-top: 0.1rem;
+  color: var(--color-muted-foreground);
+  font-size: 0.7rem;
+  text-transform: capitalize;
+}
+
+.hermes-kanban-blocked-reason-text {
+  margin: 0.75rem 0;
+  color: var(--color-foreground);
+  font-size: 0.84rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.hermes-kanban-blocked-next {
+  display: grid;
+  gap: 0.2rem;
+  padding-top: 0.7rem;
+  border-top: 1px solid color-mix(in srgb, var(--color-destructive, #d14a4a) 24%, var(--color-border));
+  color: var(--color-muted-foreground);
+  font-size: 0.76rem;
+  line-height: 1.4;
+}
+
+.hermes-kanban-blocked-next strong {
+  color: var(--color-foreground);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
