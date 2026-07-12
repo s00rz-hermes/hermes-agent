@@ -3936,6 +3936,70 @@ def test_rereview_mismatched_replacement_sha_fails_closed(kanban_home):
         }
 
 
+def test_rereview_unfinished_remediation_parent_fails_closed_on_manual_completion(
+    kanban_home,
+):
+    """An unfinished router remediation parent cannot be bypassed manually."""
+    pr_url = "https://github.com/acme/widgets/pull/45"
+    reviewed_sha = "d" * 40
+
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        remediation = kb.create_task(
+            conn,
+            title="Remediate producer after NOT CLEAN review",
+            body=(
+                f"Work on the same PR {pr_url}; complete with a full "
+                "40-character replacement_sha."
+            ),
+            assignee="author",
+            created_by="kanban-review-router",
+        )
+        rereview = kb.create_task(
+            conn,
+            title="Re-review producer after remediation",
+            body=(
+                f"Independently re-review the same PR {pr_url}. Require the "
+                f"remediation parent {remediation} handoff and its replacement_sha."
+            ),
+            assignee="reviewer",
+            created_by="kanban-review-router",
+        )
+        kb.link_tasks(conn, remediation, rereview)
+        kb.link_tasks(conn, rereview, producer)
+        _set_task_status(conn, rereview, "blocked")
+
+        assert kb.complete_task(
+            conn,
+            rereview,
+            metadata={
+                "verdict": "CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": reviewed_sha,
+            },
+        )
+
+        assert kb.get_task(conn, producer).status == "todo"
+        assert not any(
+            event.kind == "review_approved"
+            for event in kb.list_events(conn, producer)
+        )
+        deferred = [
+            event
+            for event in kb.list_events(conn, rereview)
+            if event.kind == "review_routing_deferred"
+        ]
+        assert len(deferred) == 1
+        assert deferred[0].payload == {
+            "review_task_id": rereview,
+            "verdict": "CLEAN",
+            "pr_url": pr_url,
+            "reviewed_sha": reviewed_sha,
+            "reason": "missing_or_mismatched_review_evidence",
+        }
+
+
 def test_clean_review_records_producer_handoff_for_downstream_child(kanban_home):
     """Auto-closing a CLEAN-reviewed producer must preserve its handoff."""
     pr_url = "https://github.com/acme/widgets/pull/43"

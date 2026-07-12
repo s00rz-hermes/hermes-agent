@@ -4120,19 +4120,37 @@ def _rereview_replacement_sha(
     closed when that parent or its structured handoff is missing, malformed, or
     for a different PR. Ordinary first-pass reviews have no such binding.
     """
+    review_row = conn.execute(
+        "SELECT * FROM tasks WHERE id = ?",
+        (review_task_id,),
+    ).fetchone()
+    review_text = (
+        ((review_row["title"] or "") + "\n" + (review_row["body"] or ""))
+        if review_row is not None
+        else ""
+    )
+    router_generated = (
+        review_row is not None
+        and review_row["created_by"] == "kanban-review-router"
+        and (
+            (review_row["idempotency_key"] or "").startswith("review-rereview:")
+            or "replacement_sha" in review_text
+        )
+    )
+    if not router_generated:
+        return False, None
+
     parent_rows = conn.execute(
         "SELECT p.* FROM tasks p "
         "JOIN task_links l ON l.parent_id = p.id "
-        "WHERE l.child_id = ? AND p.status = 'done'",
+        "WHERE l.child_id = ?",
         (review_task_id,),
     ).fetchall()
     remediation_parents = [
         row for row in parent_rows
         if "replacement_sha" in ((row["title"] or "") + "\\n" + (row["body"] or ""))
     ]
-    if not remediation_parents:
-        return False, None
-    if len(remediation_parents) != 1:
+    if len(remediation_parents) != 1 or remediation_parents[0]["status"] != "done":
         return True, None
 
     parent_id = remediation_parents[0]["id"]
