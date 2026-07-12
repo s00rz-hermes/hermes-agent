@@ -260,6 +260,54 @@ def test_dashboard_markdown_html_is_sanitized_before_render():
     assert "dangerouslySetInnerHTML: { __html: renderMarkdown(props.source || \"\") }" not in js
 
 
+def test_dashboard_kanban_removes_native_confirmation_dialogs():
+    """The Kanban PWA must not use browser-native confirmation popups."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "window.confirm(" not in js
+    assert "globalThis.confirm(" not in js
+    assert "requestInAppConfirm" in js
+    assert "InlineConfirm" in js
+
+
+def test_dashboard_status_actions_confirm_inline_before_mutating():
+    """Block/unblock/complete/archive expose in-card confirm/cancel controls.
+
+    Regression coverage for iOS: tapping a dangerous status action, including
+    the new Unblock flow, must arm deterministic app-owned controls and must not
+    call the PATCH path until the user taps the inline Confirm button.
+    """
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "const [pendingConfirm, setPendingConfirm] = useState(null);" in js
+    assert 'key: "unblock"' in js
+    assert 'tx(t, "confirmUnblock"' in js
+    assert "setPendingConfirm({" in js
+    assert "props.onPatch(pendingConfirm.patch)" in js
+    assert "clearPendingConfirm" in js
+    assert 'tx(t, "cancel", "Cancel")' in js
+
+
+def test_dashboard_inline_confirmations_cover_other_destructive_surfaces():
+    """Board archive, task delete/drop, bulk moves, and attachments use app UI."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "requestInAppConfirm({" in js
+    assert "setPageConfirm(Object.assign" in js
+    assert "onDeleteMany" in js
+    assert "pendingDeleteId" in js
+    assert "confirmRemoveAttachment" in js
+
+
 # ---------------------------------------------------------------------------
 # GET /tasks/:id returns body + comments + events + links
 # ---------------------------------------------------------------------------
@@ -269,6 +317,7 @@ def test_task_detail_includes_links_and_events(client):
     parent = client.post(
         "/api/plugins/kanban/tasks", json={"title": "parent"},
     ).json()["task"]
+
     child = client.post(
         "/api/plugins/kanban/tasks",
         json={"title": "child", "parents": [parent["id"]]},
