@@ -3278,6 +3278,28 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _has_deferred_review_routing_gate(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when a PR producer is held by incomplete review evidence.
+
+    ``complete_task`` records ``review_routing_deferred`` on the review parent
+    when a PR-bearing review lacks structured exact-SHA evidence (or routing
+    fails). That event must be a durable dependency gate: a later dispatcher
+    recompute sees the review parent as ``done``, but the producer must not be
+    promoted back to ``ready`` and trapped by the active-PR respawn guard.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM task_links l "
+        "JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ? AND p.status = 'done' "
+        "AND EXISTS ("
+        "    SELECT 1 FROM task_events e "
+        "    WHERE e.task_id = p.id AND e.kind = 'review_routing_deferred'"
+        ") LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None and bool(_task_pr_urls(conn, task_id))
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -3288,7 +3310,7 @@ def recompute_ready(
 
     ``blocked`` tasks are also considered for promotion (so a task
     blocked purely by a parent dependency unblocks itself when the
-    parent completes), *except* in two cases:
+    parent completes), *except* in three cases:
 
     1. The most recent block event was a worker-initiated
        ``kanban_block`` — those stay blocked until an explicit
@@ -3299,6 +3321,11 @@ def recompute_ready(
        repeatedly exhausts its iteration budget: without this guard the
        counter would reset on every recovery cycle and the circuit
        breaker could never trip (#35072).
+
+    3. A PR producer is gated by a completed review parent whose routing was
+       deferred because exact-SHA evidence was missing or unparseable. Those
+       stay inert until a remediation / re-review parent or exact-SHA review
+       provides a durable route.
 
     The effective failure limit resolves in the same order as the
     circuit breaker in ``_record_task_failure`` so the two never
@@ -3313,6 +3340,23 @@ def recompute_ready(
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
     with write_txn(conn):
+        ready_rows = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'ready'"
+        ).fetchall()
+        for row in ready_rows:
+            task_id = row["id"]
+            if not _has_deferred_review_routing_gate(conn, task_id):
+                continue
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                (task_id,),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "review_routing_deferred_gate",
+                {"reason": "review_routing_deferred"},
+            )
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
@@ -3325,6 +3369,12 @@ def recompute_ready(
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
+                continue
+            if _has_deferred_review_routing_gate(conn, task_id):
+                # A parent review completed without durable exact-SHA routing
+                # evidence. Keep the PR producer inert until a remediation /
+                # re-review owner is linked or another exact-SHA review closes
+                # it explicitly; do not feed it into active_pr respawn storms.
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
