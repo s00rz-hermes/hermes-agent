@@ -3975,6 +3975,240 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+def _review_verdict(metadata: Optional[dict]) -> Optional[str]:
+    """Return a normalized structured review verdict, if one was supplied."""
+    if not isinstance(metadata, dict):
+        return None
+    raw = metadata.get("verdict")
+    if not isinstance(raw, str):
+        return None
+    normalized = " ".join(raw.replace("_", " ").replace("-", " ").split()).upper()
+    return normalized if normalized in {"CLEAN", "NOT CLEAN"} else None
+
+
+def _review_pr_url(metadata: dict) -> Optional[str]:
+    """Extract the canonical GitHub PR URL from common reviewer metadata keys."""
+    for key in ("pr_url", "reviewed_pr", "review_pr"):
+        value = metadata.get(key)
+        if not isinstance(value, str):
+            continue
+        match = _RESPAWN_GUARD_PR_URL_RE.search(value)
+        if match:
+            return match.group(0)
+    return None
+
+
+def _reviewed_sha(metadata: dict) -> Optional[str]:
+    """Extract a full immutable SHA from common reviewer metadata keys."""
+    for key in ("reviewed_sha", "head_sha", "exact_sha"):
+        value = metadata.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40}", value.strip()):
+            return value.strip().lower()
+    return None
+
+
+def _task_pr_urls(conn: sqlite3.Connection, task_id: str) -> set[str]:
+    """Return canonical GitHub PR URLs recorded in a task's comments."""
+    urls: set[str] = set()
+    for row in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ?",
+        (task_id,),
+    ).fetchall():
+        body = row["body"] or ""
+        urls.update(match.group(0) for match in _RESPAWN_GUARD_PR_URL_RE.finditer(body))
+    return urls
+
+
+def _review_producers(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    pr_url: str,
+) -> list[Task]:
+    """Find PR-bearing producer children owned by a completed review task."""
+    rows = conn.execute(
+        "SELECT t.* FROM tasks t "
+        "JOIN task_links l ON l.child_id = t.id "
+        "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived')",
+        (review_task_id,),
+    ).fetchall()
+    return [
+        Task.from_row(row)
+        for row in rows
+        if pr_url in _task_pr_urls(conn, row["id"])
+    ]
+
+
+def _has_pr_producer_child(conn: sqlite3.Connection, review_task_id: str) -> bool:
+    """Return whether a review gates a nonterminal PR-bearing producer."""
+    rows = conn.execute(
+        "SELECT t.id FROM tasks t "
+        "JOIN task_links l ON l.child_id = t.id "
+        "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived')",
+        (review_task_id,),
+    ).fetchall()
+    return any(_task_pr_urls(conn, row["id"]) for row in rows)
+
+
+def _format_review_findings(metadata: dict) -> str:
+    """Render bounded structured findings for a remediation card body."""
+    findings = metadata.get("findings")
+    if not isinstance(findings, list):
+        findings = []
+    rendered = json.dumps(findings, indent=2, sort_keys=True, ensure_ascii=False)
+    return rendered[:6000]
+
+
+def _finalize_clean_review(
+    conn: sqlite3.Connection,
+    producer: Task,
+    *,
+    review_task_id: str,
+    pr_url: str,
+    reviewed_sha: str,
+) -> bool:
+    """Close a producer only when its final exact-SHA review is CLEAN."""
+    now = int(time.time())
+    with write_txn(conn):
+        unfinished = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            (producer.id,),
+        ).fetchone()
+        if unfinished:
+            return False
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'done', completed_at = ?, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "block_kind = NULL, block_recurrences = 0 "
+            "WHERE id = ? AND status IN ('todo', 'ready', 'blocked')",
+            (now, producer.id),
+        )
+        if cur.rowcount != 1:
+            return False
+        payload = {
+            "review_task_id": review_task_id,
+            "pr_url": pr_url,
+            "reviewed_sha": reviewed_sha,
+            "verdict": "CLEAN",
+        }
+        _append_event(conn, producer.id, "review_approved", payload)
+        _append_event(
+            conn,
+            producer.id,
+            "completed",
+            {
+                "result_len": len(producer.result) if producer.result else 0,
+                "summary": f"Exact-SHA review CLEAN at {reviewed_sha}",
+                "review": payload,
+            },
+        )
+    _clear_failure_counter(conn, producer.id)
+    return True
+
+
+def _route_review_completion(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    metadata: Optional[dict],
+) -> bool:
+    """Route exact-SHA review outcomes without re-spawning PR producers.
+
+    A review task is a parent of the PR-bearing producer it evaluates. CLEAN
+    closes that producer. NOT CLEAN creates one idempotent same-PR remediation
+    owner plus one dependent exact-SHA re-review, and links the re-review back
+    as a producer parent so dependency promotion cannot feed the original card
+    into the ``active_pr`` respawn guard.
+    """
+    verdict = _review_verdict(metadata)
+    if verdict is None or not isinstance(metadata, dict):
+        return False
+    pr_url = _review_pr_url(metadata)
+    reviewed_sha = _reviewed_sha(metadata)
+    if pr_url is None or reviewed_sha is None:
+        return False
+    review_task = get_task(conn, review_task_id)
+    if review_task is None:
+        return False
+    producers = _review_producers(conn, review_task_id, pr_url)
+    if not producers:
+        return False
+
+    handled = False
+    for producer in producers:
+        if verdict == "CLEAN":
+            handled = _finalize_clean_review(
+                conn,
+                producer,
+                review_task_id=review_task_id,
+                pr_url=pr_url,
+                reviewed_sha=reviewed_sha,
+            ) or handled
+            continue
+
+        findings = _format_review_findings(metadata)
+        producer_requirements = (producer.body or "").strip()[:_CTX_MAX_BODY_BYTES]
+        remediation_id = create_task(
+            conn,
+            title=f"Remediate {producer.title} after NOT CLEAN review",
+            body=(
+                f"Remediate findings from exact-SHA review {review_task_id} of "
+                f"{pr_url} at {reviewed_sha}. Work on the same branch and same PR. "
+                "Do not open a companion, stacked, or replacement PR. Run focused "
+                "validation, push the replacement commit to that PR branch, and "
+                "complete with metadata containing pr_url, branch, and a full "
+                "40-character replacement_sha.\n\nStructured findings:\n"
+                f"{findings}\n\nOriginal producer requirements ({producer.id}):\n"
+                f"{producer_requirements or producer.title}"
+            ),
+            assignee=producer.assignee,
+            created_by="kanban-review-router",
+            tenant=producer.tenant,
+            priority=producer.priority,
+            parents=(review_task_id,),
+            idempotency_key=f"review-remediation:{producer.id}:{reviewed_sha}",
+            skills=producer.skills,
+            board=get_current_board(),
+        )
+        rereview_id = create_task(
+            conn,
+            title=f"Re-review {producer.title} after remediation",
+            body=(
+                f"Independently re-review the same PR {pr_url} after remediation "
+                f"{remediation_id}. Read that parent handoff and require its full "
+                "40-character replacement_sha; refuse to review a moving branch or "
+                "any other SHA. Verify there is still exactly one PR and no companion "
+                "PR. Complete with structured metadata: verdict CLEAN or NOT CLEAN, "
+                "pr_url, reviewed_sha equal to replacement_sha, reviewer identity, "
+                "and findings. Do not remediate from this review card."
+            ),
+            assignee=review_task.assignee,
+            created_by="kanban-review-router",
+            tenant=producer.tenant,
+            priority=producer.priority,
+            parents=(remediation_id,),
+            idempotency_key=f"review-rereview:{producer.id}:{reviewed_sha}",
+            skills=review_task.skills,
+            board=get_current_board(),
+        )
+        link_tasks(conn, rereview_id, producer.id)
+        with write_txn(conn):
+            _append_event(
+                conn,
+                producer.id,
+                "review_remediation_routed",
+                {
+                    "review_task_id": review_task_id,
+                    "remediation_task_id": remediation_id,
+                    "rereview_task_id": rereview_id,
+                    "pr_url": pr_url,
+                    "reviewed_sha": reviewed_sha,
+                },
+            )
+        handled = True
+    return handled
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4154,8 +4388,37 @@ def complete_task(
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
-    # Recompute ready status for dependents (separate txn so children see done).
-    recompute_ready(conn)
+    # Route structured review outcomes before dependency promotion. On NOT
+    # CLEAN the dependent re-review becomes an unfinished parent of the PR
+    # producer, so that producer never enters ``ready`` and cannot be trapped
+    # by the ``active_pr`` respawn guard. Missing/invalid exact-SHA metadata or
+    # a routing failure fails safe: leave the producer in ``todo`` and emit one
+    # durable diagnostic instead of promoting it into a guard/event storm.
+    verdict = _review_verdict(metadata)
+    review_route_required = bool(verdict) and _has_pr_producer_child(conn, task_id)
+    review_routed = False
+    route_failed = False
+    if review_route_required:
+        try:
+            review_routed = _route_review_completion(conn, task_id, metadata)
+        except Exception:
+            route_failed = True
+            _log.exception("kanban: failed to route review completion for %s", task_id)
+        if not review_routed:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "review_routing_deferred",
+                    {
+                        "verdict": verdict,
+                        "reason": "route_failed" if route_failed else "missing_or_mismatched_review_evidence",
+                    },
+                )
+    if not review_route_required or review_routed:
+        # Separate txn so children see the completed parent and any review
+        # routing links created above.
+        recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -7251,13 +7514,28 @@ def _dispatch_once_locked(
             result.respawn_guarded.append((row["id"], guard_reason))
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
-            # this the task appears stuck in ready with no diagnosis.
+            # this the task appears stuck in ready with no diagnosis. Coalesce
+            # identical consecutive guards so the durable log records the
+            # state once rather than growing by one row every dispatcher tick.
             if not dry_run:
-                with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
-                    )
+                latest_event = conn.execute(
+                    "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (row["id"],),
+                ).fetchone()
+                latest_reason = None
+                if latest_event and latest_event["kind"] == "respawn_guarded":
+                    try:
+                        latest_payload = json.loads(latest_event["payload"] or "{}")
+                        latest_reason = latest_payload.get("reason")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        latest_reason = None
+                if latest_reason != guard_reason:
+                    with write_txn(conn):
+                        _append_event(
+                            conn, row["id"], "respawn_guarded",
+                            {"reason": guard_reason},
+                        )
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
