@@ -56,20 +56,15 @@ Every claim must end in exactly one of:
 
 The kanban kernel enforces that exactly one of these terminates each run. A worker that calls neither and exits normally is treated as crashed.
 
-## Outputs and the code-review convention
+## Outputs and the review-required convention
 
-Research, analysis, and other terminal deliverables can complete normally with a structured handoff. Code-changing graphs use a stricter convention layered on top of the kernel:
+For most code-changing tasks, the work isn't truly *done* the moment the worker finishes — it needs a human reviewer. The kanban kernel doesn't enforce this distinction (a "code-changing task" is fuzzy and forcing block-instead-of-complete on every code worker would break flows where no review is wanted). It's a convention layered on top:
 
-- Designate exactly one **PR-owning card** for each independently mergeable change. It alone owns the canonical worktree, branch, and PR.
-- Open or reuse a **draft PR after the first meaningful checkpoint**, not as an empty placeholder and not only after all implementation is finished. Record the repository, branch, PR URL, and head SHA in a durable Kanban comment.
-- Helper, test, reviewer, and remediation cards contribute evidence or patches to the owning branch; they do not open companion PRs for the same change.
-- When implementation and validation are complete, create or reuse one reviewer child parented on the implementation card and pinned to the exact current head SHA. Then complete the implementation card as a handoff so dependency promotion can start review.
-- A reviewer that finds problems routes focused remediation to the **same PR branch**. Every pushed replacement head requires a fresh exact-head verdict.
-- Only a clean exact-head reviewer may mark the draft PR ready. Repository checks, conflicts, labels, and human/operator authority boundaries remain independent gates.
+- **Block instead of complete**, with `reason` prefixed `review-required: ` so the dashboard / `hermes kanban show` surfaces the row as awaiting review.
+- **Drop structured metadata into a `kanban_comment` first** since `kanban_block` only carries the human-readable `reason`. Comments are the durable annotation channel — every audit-relevant field (changed_files, tests_run, diff_path or PR url, decisions) belongs there.
+- **Reviewer either approves and unblocks**, which respawns the worker with the comment thread for follow-ups; or asks for changes via another comment, which the next worker run sees as part of `kanban_show`'s context.
 
-For a broad swarm, parallelize discovery, analysis, or truly independent changes. Fan tightly coupled findings into one synthesis and one PR-owning implementation card. Multiple PR-owning cards are appropriate only when the changes are independently mergeable and revertable, such as separate repositories or non-overlapping components.
-
-The injected `KANBAN_GUIDANCE` carries this contract into every worker. The kernel stays repository-agnostic: it does not guess whether a task is code-producing or call GitHub on the worker's behalf.
+The injected `KANBAN_GUIDANCE` covers both `kanban_complete` (truly terminal tasks — typo fixes, docs changes, research writeups) and the `review-required` block pattern.
 
 ## Logs and audit trail
 

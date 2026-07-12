@@ -259,8 +259,6 @@ AUTHOR_MAP = {
     "dbeyer7@gmail.com": "benegessarit",
     "264773240+MrDiamondBallz@users.noreply.github.com": "MrDiamondBallz",
     "claudlos@agentmail.to": "claudlos",  # PR #52351 salvage (cron base_url exfil guard; #<salvagePR>)
-    "gigakun@agentmail.to": "gigakun3030",  # PR #61163 salvage (OpenCode Zen model catalog cleanup)
-    "hermes-agent@users.noreply.github.com": "s00rz",  # PR #2 fork-local agent-authored Kanban draft-PR review pipeline
     "94890352+Adolanium@users.noreply.github.com": "Adolanium",
     "kenmege@yahoo.com": "Kenmege",
     "tianying.x@eukarya.io": "xtymac",
