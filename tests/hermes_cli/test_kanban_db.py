@@ -2492,6 +2492,112 @@ def test_dispatch_respawn_guard_active_pr_bypassed_by_requeue(
     assert t in spawned_ids
 
 
+def test_dispatch_respawn_guard_active_pr_not_bypassed_by_auto_reclaim(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """Automatic stale-claim recovery must NOT bypass active_pr.
+
+    ``release_stale_claims()`` emits ``reclaimed`` when a worker dies or its
+    claim expires — the crash-after-opening-a-PR case guard 4 suppresses.
+    Drives the real producer path, not a synthetic event.
+    """
+    import hermes_cli.kanban_db as _kb
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="crashed-pr-owner", assignee="alice")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        # Backdate the comment so the auto-reclaim event lands strictly
+        # after it (integer-second clocks would otherwise tie).
+        conn.execute(
+            "UPDATE task_comments SET created_at = created_at - 5 "
+            "WHERE task_id = ?",
+            (t,),
+        )
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 3600, t),
+        )
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        assert kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None) == 1
+        assert kb.get_task(conn, t).status == "ready"
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") in res.respawn_guarded
+    assert t not in spawned_ids
+
+
+def test_dispatch_respawn_guard_active_pr_bypassed_by_manual_reclaim(
+    kanban_home, all_assignees_spawnable
+):
+    """An operator-driven ``reclaim_task()`` (payload manual=true) bypasses."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="operator-rerun", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        conn.execute(
+            "UPDATE task_comments SET created_at = created_at - 5 "
+            "WHERE task_id = ?",
+            (t,),
+        )
+        kb.claim_task(conn, t)
+        assert kb.reclaim_task(conn, t, reason="operator rerun",
+                               signal_fn=lambda _p, _s: None)
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") not in res.respawn_guarded
+    assert t in spawned_ids
+
+
+def test_dispatch_respawn_guard_active_pr_same_second_event_fails_closed(
+    kanban_home, all_assignees_spawnable
+):
+    """A re-queue event in the SAME second as the PR comment does not bypass.
+
+    Comments and events share integer-second clocks; a >= comparison would
+    treat a pre-comment same-second event as "after". Strict > fails closed.
+    """
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="same-second", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        row = conn.execute(
+            "SELECT created_at FROM task_comments WHERE task_id = ?", (t,)
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, row["created_at"]),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") in res.respawn_guarded
+    assert t not in spawned_ids
+
+
 def test_dispatch_respawn_guard_dry_run_no_auto_block(
     kanban_home, all_assignees_spawnable
 ):

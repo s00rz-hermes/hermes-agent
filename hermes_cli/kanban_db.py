@@ -7773,13 +7773,31 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             if latest_pr_comment_at is None or at > latest_pr_comment_at:
                 latest_pr_comment_at = at
     if latest_pr_comment_at is not None:
-        requeued_after = conn.execute(
-            "SELECT 1 FROM task_events "
-            "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
-            "LIMIT 1",
+        # Strict ``>``: comments and events share integer-second clocks, so a
+        # ``>=`` would count a pre-comment event in the same second as
+        # "after" and silently bypass. Fail closed on the tie.
+        requeue_rows = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND created_at > ? "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed')",
             (task_id, latest_pr_comment_at),
-        ).fetchone()
+        ).fetchall()
+        requeued_after = False
+        for ev in requeue_rows:
+            if ev["kind"] == "reclaimed":
+                # ``release_stale_claims()`` also emits ``reclaimed`` when a
+                # worker dies or its claim expires — the exact
+                # crash-after-opening-a-PR case this guard suppresses. Only
+                # an operator-driven ``reclaim_task()`` (payload
+                # ``{"manual": true}``) is a deliberate re-run request.
+                try:
+                    manual = bool(json.loads(ev["payload"] or "{}").get("manual"))
+                except (TypeError, ValueError):
+                    manual = False
+                if not manual:
+                    continue
+            requeued_after = True
+            break
         if not requeued_after:
             return "active_pr"
 
