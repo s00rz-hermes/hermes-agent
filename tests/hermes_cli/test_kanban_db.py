@@ -2460,6 +2460,38 @@ def test_dispatch_respawn_guard_skips_active_pr(
         assert kb.get_task(conn, t).status == "ready"
 
 
+def test_dispatch_respawn_guard_active_pr_bypassed_by_requeue(
+    kanban_home, all_assignees_spawnable
+):
+    """An explicit re-queue event after the newest PR-URL comment bypasses active_pr.
+
+    PR-steward cards (refresh/remediate/un-draft lanes) cite their PR in
+    nearly every comment; a park->release or block->unblock is a deliberate
+    "run it again" and must not freeze the lane for the 24h guard window.
+    """
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="pr-steward", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Refreshed https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        # Explicit re-queue AFTER the PR-URL comment (e.g. unblock).
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, int(time.time()) + 1),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") not in res.respawn_guarded
+    assert t in spawned_ids
+
+
 def test_dispatch_respawn_guard_dry_run_no_auto_block(
     kanban_home, all_assignees_spawnable
 ):
