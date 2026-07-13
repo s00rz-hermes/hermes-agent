@@ -2536,6 +2536,38 @@ def test_dispatch_respawn_guard_active_pr_not_bypassed_by_auto_reclaim(
     assert t not in spawned_ids
 
 
+def test_dispatch_respawn_guard_active_pr_requires_literal_manual_true(
+    kanban_home, all_assignees_spawnable
+):
+    """Only the literal JSON boolean true bypasses; truthy strings do not,
+    and a non-object payload neither bypasses nor crashes dispatch."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        for payload in ('{"manual": "false"}', '{"manual": 1}', '[]', 'null'):
+            t = kb.create_task(conn, title=f"pr-{payload[:6]}", assignee="alice")
+            kb.add_comment(
+                conn, t, "worker",
+                "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+            )
+            conn.execute(
+                "UPDATE task_comments SET created_at = created_at - 5 "
+                "WHERE task_id = ?",
+                (t,),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'reclaimed', ?, ?)",
+                (t, payload, int(time.time()) + 1),
+            )
+            res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+            assert (t, "active_pr") in res.respawn_guarded, payload
+            assert t not in spawned_ids, payload
+
+
 def test_dispatch_respawn_guard_active_pr_bypassed_by_manual_reclaim(
     kanban_home, all_assignees_spawnable
 ):

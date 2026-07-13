@@ -7790,9 +7790,16 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
                 # crash-after-opening-a-PR case this guard suppresses. Only
                 # an operator-driven ``reclaim_task()`` (payload
                 # ``{"manual": true}``) is a deliberate re-run request.
+                # Fail closed on anything else: the literal JSON boolean is
+                # required (truthy strings don't count), and malformed or
+                # non-object payloads must never crash the dispatch path.
                 try:
-                    manual = bool(json.loads(ev["payload"] or "{}").get("manual"))
-                except (TypeError, ValueError):
+                    payload = json.loads(ev["payload"] or "{}")
+                    manual = (
+                        isinstance(payload, dict)
+                        and payload.get("manual") is True
+                    )
+                except Exception:
                     manual = False
                 if not manual:
                     continue
