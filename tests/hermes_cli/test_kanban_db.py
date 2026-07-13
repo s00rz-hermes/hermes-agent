@@ -872,7 +872,13 @@ def test_resolve_crash_grace_seconds_handles_bad_env(monkeypatch):
 
 
 def _exited_status(code: int) -> int:
-    """Raw wait-status for a WIFEXITED child with the given exit code."""
+    """Recorded exit status for a child with the given exit code.
+
+    POSIX records the raw wait status (WIFEXITED encoding); Windows
+    records ``Popen.returncode`` directly (see ``_reap_windows_workers``).
+    """
+    if os.name == "nt":
+        return code
     return code << 8
 
 
@@ -979,6 +985,421 @@ def test_real_crash_still_counts_and_trips_breaker(kanban_home, monkeypatch):
         assert task.status == "blocked", (
             f"genuine crashes should still trip the breaker, got {task.status}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Windows exit-code capture: retained Popen handles make worker exit codes
+# visible on nt, where there is no waitpid()-style reaping. Without this,
+# every worker death is an opaque "pid N not alive" crash and the
+# rate-limit-requeue / protocol-violation protections are dead code.
+# ---------------------------------------------------------------------------
+
+_windows_only = pytest.mark.skipif(
+    os.name != "nt", reason="Windows-only exit-code capture path"
+)
+
+
+class _FakeProc:
+    """Stand-in for a spawned worker's Popen handle."""
+
+    def __init__(self, pid: int, rc=None):
+        self.pid = pid
+        self._rc = rc
+
+    def poll(self):
+        return self._rc
+
+    def exit(self, rc: int) -> None:
+        self._rc = rc
+
+
+@pytest.fixture
+def clean_worker_registry():
+    kb._windows_worker_procs.clear()
+    kb._recent_worker_exits.clear()
+    yield
+    kb._windows_worker_procs.clear()
+    kb._recent_worker_exits.clear()
+
+
+@_windows_only
+def test_windows_reap_records_real_exit_codes(clean_worker_registry):
+    running = _FakeProc(41000, rc=None)
+    rate_limited = _FakeProc(41001, rc=kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    clean = _FakeProc(41002, rc=0)
+    failed = _FakeProc(41003, rc=1)
+    for p in (running, rate_limited, clean, failed):
+        kb._register_worker_proc(p)
+
+    reaped = kb.reap_worker_zombies()
+    assert sorted(reaped) == [41001, 41002, 41003]
+
+    assert kb._classify_worker_exit(41001) == (
+        "rate_limited", kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+    )
+    assert kb._classify_worker_exit(41002) == ("clean_exit", 0)
+    assert kb._classify_worker_exit(41003) == ("nonzero_exit", 1)
+    # Still-running worker: nothing recorded, classification stays unknown.
+    assert kb._classify_worker_exit(41000) == ("unknown", None)
+
+    # A second reap does not double-record already-reaped exits.
+    assert kb.reap_worker_zombies() == []
+
+
+@_windows_only
+def test_windows_classify_falls_back_to_retained_handle(clean_worker_registry):
+    # A caller that reaches classification without a reap tick first (e.g.
+    # a watcher calling detect_crashed_workers directly) still gets the
+    # real exit code straight from the retained handle.
+    proc = _FakeProc(42000, rc=kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    kb._register_worker_proc(proc)
+    assert kb._classify_worker_exit(42000) == (
+        "rate_limited", kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+    )
+
+
+@_windows_only
+def test_windows_worker_alive_defeats_pid_reuse(
+    clean_worker_registry, monkeypatch,
+):
+    # The pid LOOKS alive (recycled by an unrelated process), but the
+    # retained handle knows the worker exited — handle wins.
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    proc = _FakeProc(43000, rc=None)
+    kb._register_worker_proc(proc)
+    assert kb._worker_alive(43000) is True
+    proc.exit(1)
+    assert kb._worker_alive(43000) is False
+    # No retained handle → fall back to the pid probe (today's behavior).
+    assert kb._worker_alive(43999) is True
+
+
+@_windows_only
+def test_windows_exited_handles_released_after_ttl(
+    clean_worker_registry, monkeypatch,
+):
+    proc = _FakeProc(44000, rc=0)
+    kb._register_worker_proc(proc)
+    kb.reap_worker_zombies()
+    assert 44000 in kb._windows_worker_procs
+
+    # Past the exit-record TTL the handle is dropped, releasing the pid.
+    real_time = time.time()
+    monkeypatch.setattr(
+        kb.time, "time",
+        lambda: real_time + kb._RECENT_WORKER_EXIT_TTL_SECONDS + 61,
+    )
+    kb.reap_worker_zombies()
+    assert 44000 not in kb._windows_worker_procs
+
+
+@_windows_only
+def test_windows_rate_limit_exit_requeues_via_detect_crashed_workers(
+    kanban_home, clean_worker_registry, monkeypatch,
+):
+    """End-to-end on nt: a registered worker that exits with the rate-limit
+    sentinel is requeued to ``ready`` without counting a failure — the
+    protection that was dead code while exit codes were invisible."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="nt-rl", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+
+        proc = _FakeProc(45000, rc=None)
+        kb._register_worker_proc(proc)
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (45000, tid),
+        )
+        conn.commit()
+
+        # Worker dies on a quota wall; the pid probe would say "not alive".
+        proc.exit(kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        kb.reap_worker_zombies()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed
+        assert tid in getattr(
+            kb.detect_crashed_workers, "_last_rate_limited", [],
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+
+
+@_windows_only
+def test_windows_protocol_violation_classified_via_handle(
+    kanban_home, clean_worker_registry, monkeypatch,
+):
+    """End-to-end on nt: a clean exit (rc=0) with the task still running is
+    classified as a protocol violation instead of an opaque crash."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="nt-pv", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+
+        proc = _FakeProc(46000, rc=0)
+        kb._register_worker_proc(proc)
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (46000, tid),
+        )
+        conn.commit()
+        kb.reap_worker_zombies()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid in crashed
+        run = conn.execute(
+            "SELECT error FROM task_runs WHERE task_id=? "
+            "ORDER BY id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        assert "protocol violation" in (run["error"] or "")
+
+
+# ---------------------------------------------------------------------------
+# Breaker override-limit persistence: a systemic/protocol trip at
+# failure_limit=1 must not be re-promoted by recompute_ready (which only
+# knows the config limit) in the same tick. Regression for the 2026-07-11
+# cascade where every "protected" card burned a second doomed spawn.
+# ---------------------------------------------------------------------------
+
+
+def test_override_trip_persists_limit_and_blocks_repromotion(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="systemic", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET status='ready' WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        tripped = _kb._record_task_failure(
+            conn, tid,
+            error="pid 123 not alive",
+            outcome="crashed",
+            failure_limit=1,          # systemic fast-path override
+            persist_limit=True,
+        )
+        assert tripped is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 1
+        # The override limit is stamped so all later readers agree.
+        assert task.max_retries == 1
+
+        # The bug: recompute_ready with the CONFIG limit (2) used to see
+        # cf=1 < 2 and re-promote the card the same tick.
+        promoted = kb.recompute_ready(conn, failure_limit=2)
+        assert promoted == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_normal_trip_does_not_stamp_max_retries(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="normal", assignee="a")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        conn.commit()
+        for _ in range(2):
+            _kb._record_task_failure(
+                conn, tid,
+                error="boom", outcome="crashed", failure_limit=2,
+            )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 2
+        assert task.max_retries is None  # config-limit trips leave it alone
+
+
+def test_existing_task_max_retries_not_overwritten_by_override_trip(
+    kanban_home,
+):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="pinned", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET status='ready', max_retries=5, "
+            "consecutive_failures=4 WHERE id=?", (tid,),
+        )
+        conn.commit()
+        _kb._record_task_failure(
+            conn, tid,
+            error="boom", outcome="crashed", failure_limit=1,
+            persist_limit=True,
+        )
+        # Per-task max_retries already won resolution; it must not be
+        # clobbered by the override stamp.
+        assert kb.get_task(conn, tid).max_retries == 5
+
+
+# ---------------------------------------------------------------------------
+# Global quota-wall brake
+# ---------------------------------------------------------------------------
+
+
+def test_rate_limit_wall_roundtrip_and_extend_only(kanban_home):
+    with kb.connect() as conn:
+        assert kb.get_rate_limit_wall(conn) is None
+        until = kb.set_rate_limit_wall(conn, source="test")
+        assert until > time.time()
+        assert kb.get_rate_limit_wall(conn) == pytest.approx(until, abs=1)
+
+        # Walls only extend — an earlier resets_at is ignored.
+        sooner = time.time() + 30
+        kept = kb.set_rate_limit_wall(conn, resets_at=sooner, source="t2")
+        assert kept == pytest.approx(until, abs=1)
+
+        later = time.time() + 900
+        extended = kb.set_rate_limit_wall(conn, resets_at=later, source="t3")
+        assert extended == pytest.approx(later, abs=1)
+
+        # A garbled far-future resets_at is capped.
+        capped = kb.set_rate_limit_wall(
+            conn, resets_at=time.time() + 999999, source="t4",
+        )
+        assert capped <= time.time() + kb.RATE_LIMIT_WALL_CAP_SECONDS + 1
+
+
+def test_expired_rate_limit_wall_reads_as_clear(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        kb.set_rate_limit_wall(conn, resets_at=time.time() + 60)
+        real_time = time.time
+        monkeypatch.setattr(kb.time, "time", lambda: real_time() + 120)
+        assert kb.get_rate_limit_wall(conn) is None
+
+
+def test_dispatch_skips_all_spawns_while_wall_active(kanban_home, monkeypatch):
+    import hermes_cli.profiles as _profiles
+
+    monkeypatch.setattr(_profiles, "profile_exists", lambda _name: True)
+    spawned = []
+
+    def _stub_spawn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 12345
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="doomed", assignee="a")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        conn.commit()
+
+        kb.set_rate_limit_wall(conn, resets_at=time.time() + 300)
+        result = kb.dispatch_once(conn, spawn_fn=_stub_spawn)
+        assert result.rate_limit_wall_until is not None
+        assert spawned == []
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # Clear the wall → the same card spawns normally.
+        conn.execute(
+            "DELETE FROM kanban_meta WHERE key=?",
+            (kb.RATE_LIMIT_WALL_META_KEY,),
+        )
+        conn.commit()
+        result = kb.dispatch_once(conn, spawn_fn=_stub_spawn)
+        assert result.rate_limit_wall_until is None
+        assert spawned == [tid]
+
+
+def test_rate_limited_exit_records_global_wall(kanban_home, monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="wall", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (77000, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(
+            77000, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        )
+        kb.detect_crashed_workers(conn)
+        assert kb.get_rate_limit_wall(conn) is not None
+
+
+def test_worker_side_wall_drop_uses_env_pinned_db(kanban_home, monkeypatch):
+    # Workers inherit HERMES_KANBAN_DB from the dispatcher; the wall they
+    # drop must land in that DB.
+    monkeypatch.setenv(
+        "HERMES_KANBAN_DB", str(kb.kanban_db_path()),
+    )
+    until = kb.record_rate_limit_wall_for_worker(
+        "usage_limit_reached resets_at=%d" % int(time.time() + 1200),
+    )
+    assert until is not None
+    with kb.connect() as conn:
+        assert kb.get_rate_limit_wall(conn) == pytest.approx(until, abs=1)
+
+
+# ---------------------------------------------------------------------------
+# Crash backoff
+# ---------------------------------------------------------------------------
+
+
+def test_crash_backoff_defers_respawn_then_releases(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="backoff", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (78000, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(78000, _exited_status(1))
+        kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1
+
+        # Fresh crash → deferred by the exponential backoff.
+        assert kb.check_respawn_guard(conn, tid) == "crash_backoff"
+
+        # Once the delay elapses the guard releases.
+        base = _kb._resolve_crash_backoff_base_seconds()
+        real_time = time.time
+        monkeypatch.setattr(
+            _kb.time, "time", lambda: real_time() + base + 1,
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_crash_backoff_disabled_via_env(kanban_home, monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_BACKOFF_BASE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="nobackoff", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (79000, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(79000, _exited_status(1))
+        kb.detect_crashed_workers(conn)
+        assert kb.check_respawn_guard(conn, tid) is None
 
 
 def test_respawn_guard_defers_rate_limited_within_cooldown(
@@ -2037,6 +2458,176 @@ def test_dispatch_respawn_guard_skips_active_pr(
     assert t not in res.auto_blocked
     with kb.connect() as conn:
         assert kb.get_task(conn, t).status == "ready"
+
+
+def test_dispatch_respawn_guard_active_pr_bypassed_by_requeue(
+    kanban_home, all_assignees_spawnable
+):
+    """An explicit re-queue event after the newest PR-URL comment bypasses active_pr.
+
+    PR-steward cards (refresh/remediate/un-draft lanes) cite their PR in
+    nearly every comment; a park->release or block->unblock is a deliberate
+    "run it again" and must not freeze the lane for the 24h guard window.
+    """
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="pr-steward", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Refreshed https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        # Explicit re-queue AFTER the PR-URL comment (e.g. unblock).
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, int(time.time()) + 1),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") not in res.respawn_guarded
+    assert t in spawned_ids
+
+
+def test_dispatch_respawn_guard_active_pr_not_bypassed_by_auto_reclaim(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """Automatic stale-claim recovery must NOT bypass active_pr.
+
+    ``release_stale_claims()`` emits ``reclaimed`` when a worker dies or its
+    claim expires — the crash-after-opening-a-PR case guard 4 suppresses.
+    Drives the real producer path, not a synthetic event.
+    """
+    import hermes_cli.kanban_db as _kb
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="crashed-pr-owner", assignee="alice")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        # Backdate the comment so the auto-reclaim event lands strictly
+        # after it (integer-second clocks would otherwise tie).
+        conn.execute(
+            "UPDATE task_comments SET created_at = created_at - 5 "
+            "WHERE task_id = ?",
+            (t,),
+        )
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 3600, t),
+        )
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        assert kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None) == 1
+        assert kb.get_task(conn, t).status == "ready"
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") in res.respawn_guarded
+    assert t not in spawned_ids
+
+
+def test_dispatch_respawn_guard_active_pr_requires_literal_manual_true(
+    kanban_home, all_assignees_spawnable
+):
+    """Only the literal JSON boolean true bypasses; truthy strings do not,
+    and a non-object payload neither bypasses nor crashes dispatch."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        for payload in ('{"manual": "false"}', '{"manual": 1}', '[]', 'null'):
+            t = kb.create_task(conn, title=f"pr-{payload[:6]}", assignee="alice")
+            kb.add_comment(
+                conn, t, "worker",
+                "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+            )
+            conn.execute(
+                "UPDATE task_comments SET created_at = created_at - 5 "
+                "WHERE task_id = ?",
+                (t,),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'reclaimed', ?, ?)",
+                (t, payload, int(time.time()) + 1),
+            )
+            res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+            assert (t, "active_pr") in res.respawn_guarded, payload
+            assert t not in spawned_ids, payload
+
+
+def test_dispatch_respawn_guard_active_pr_bypassed_by_manual_reclaim(
+    kanban_home, all_assignees_spawnable
+):
+    """An operator-driven ``reclaim_task()`` (payload manual=true) bypasses."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="operator-rerun", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        conn.execute(
+            "UPDATE task_comments SET created_at = created_at - 5 "
+            "WHERE task_id = ?",
+            (t,),
+        )
+        kb.claim_task(conn, t)
+        assert kb.reclaim_task(conn, t, reason="operator rerun",
+                               signal_fn=lambda _p, _s: None)
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") not in res.respawn_guarded
+    assert t in spawned_ids
+
+
+def test_dispatch_respawn_guard_active_pr_same_second_event_fails_closed(
+    kanban_home, all_assignees_spawnable
+):
+    """A re-queue event in the SAME second as the PR comment does not bypass.
+
+    Comments and events share integer-second clocks; a >= comparison would
+    treat a pre-comment same-second event as "after". Strict > fails closed.
+    """
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="same-second", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        row = conn.execute(
+            "SELECT created_at FROM task_comments WHERE task_id = ?", (t,)
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, row["created_at"]),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") in res.respawn_guarded
+    assert t not in spawned_ids
 
 
 def test_dispatch_respawn_guard_dry_run_no_auto_block(
@@ -5311,3 +5902,72 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+# ---------------------------------------------------------------------------
+# Skill validation at card-authoring time: unknown skills are stripped
+# against the assignee's installed roster so a bad skill list can't
+# spawn-kill a worker at argparse (37 deterministic worker deaths on the
+# 2026-07-11 board traced to this).
+# ---------------------------------------------------------------------------
+
+
+def _install_skill(home, profile, category, name):
+    d = home / "profiles" / profile / "skills" / category / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
+
+
+def test_create_task_strips_unknown_skills_for_assignee(kanban_home):
+    import json
+
+    kb._skill_roster_cache.clear()
+    _install_skill(kanban_home, "tester", "devops", "skill-a")
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="s", assignee="tester",
+            skills=["skill-a", "ghost-skill"],
+        )
+        task = kb.get_task(conn, tid)
+        assert task.skills == ["skill-a"]
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='created'",
+            (tid,),
+        ).fetchone()
+        payload = json.loads(ev["payload"])
+        assert payload["skills_stripped"] == ["ghost-skill"]
+
+
+def test_create_task_all_unknown_skills_degrades_to_no_skills(kanban_home):
+    kb._skill_roster_cache.clear()
+    _install_skill(kanban_home, "tester2", "devops", "real-skill")
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="s", assignee="tester2",
+            skills=["ghost-a", "ghost-b"],
+        )
+        # Better a worker without force-loaded skills than a worker that
+        # dies at argparse and breaker-blocks the card.
+        assert kb.get_task(conn, tid).skills in (None, [])
+
+
+def test_create_task_keeps_skills_when_roster_unknown(kanban_home):
+    kb._skill_roster_cache.clear()
+    with kb.connect() as conn:
+        # Assignee has no profile dir at all — validation must not guess.
+        tid = kb.create_task(
+            conn, title="s", assignee="no-such-profile",
+            skills=["anything"],
+        )
+        assert kb.get_task(conn, tid).skills == ["anything"]
+
+
+def test_skill_validation_kill_switch(kanban_home, monkeypatch):
+    kb._skill_roster_cache.clear()
+    _install_skill(kanban_home, "tester3", "devops", "skill-a")
+    monkeypatch.setenv("HERMES_KANBAN_SKILL_VALIDATION", "0")
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="s", assignee="tester3",
+            skills=["ghost-skill"],
+        )
+        assert kb.get_task(conn, tid).skills == ["ghost-skill"]
+

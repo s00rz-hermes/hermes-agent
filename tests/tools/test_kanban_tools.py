@@ -2221,3 +2221,90 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     d = json.loads(out)
     assert d["ok"] is True, d
     assert d["subscribed"] is False, d
+
+
+# ---------------------------------------------------------------------------
+# Operator-channel auto-subscribe fallback: cards created with no session
+# context (dispatcher / decomposer / cron) subscribe the configured
+# operator channel instead of being born silent.
+# ---------------------------------------------------------------------------
+
+
+def test_operator_channel_parses_config(monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(
+        kt, "load_config",
+        lambda: {"kanban": {"operator_channel": "telegram:8899043467"}},
+    )
+    assert kt._operator_channel_from_config() == (
+        "telegram", "8899043467", None, "default",
+    )
+
+    monkeypatch.setattr(
+        kt, "load_config",
+        lambda: {"kanban": {
+            "operator_channel": "telegram:-100123:42",
+            "operator_notifier_profile": "gatewayprof",
+        }},
+    )
+    assert kt._operator_channel_from_config() == (
+        "telegram", "-100123", "42", "gatewayprof",
+    )
+
+    for bad in ("", "telegram", "telegram:", ":123"):
+        monkeypatch.setattr(
+            kt, "load_config",
+            lambda _b=bad: {"kanban": {"operator_channel": _b}},
+        )
+        assert kt._operator_channel_from_config() is None
+
+
+def test_auto_subscribe_falls_back_to_operator_channel(
+    monkeypatch, worker_env,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    # No session context of any kind.
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.setattr(
+        kt, "load_config",
+        lambda: {"kanban": {"operator_channel": "telegram:8899043467"}},
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="orphan", assignee="a")
+        assert kt._maybe_auto_subscribe(conn, tid) is True
+        sub = conn.execute(
+            "SELECT platform, chat_id, notifier_profile "
+            "FROM kanban_notify_subs WHERE task_id = ?", (tid,),
+        ).fetchone()
+        assert sub is not None
+        assert sub["platform"] == "telegram"
+        assert sub["chat_id"] == "8899043467"
+        assert sub["notifier_profile"] == "default"
+    finally:
+        conn.close()
+
+
+def test_auto_subscribe_no_channel_configured_still_noop(
+    monkeypatch, worker_env,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.setattr(kt, "load_config", lambda: {})
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="orphan2", assignee="a")
+        assert kt._maybe_auto_subscribe(conn, tid) is False
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?",
+            (tid,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()

@@ -1263,6 +1263,12 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+CREATE TABLE IF NOT EXISTS kanban_meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -2383,6 +2389,71 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+# Roster cache for skill validation at card-authoring time. Keyed by the
+# profile home; entries expire quickly so freshly-installed skills are
+# picked up within a tick.
+_SKILL_ROSTER_CACHE_TTL_SECONDS = 60
+_skill_roster_cache: "dict[str, tuple[float, frozenset[str]]]" = {}
+
+
+def _assignee_skill_roster(assignee: Optional[str]) -> Optional[frozenset]:
+    """Best-effort set of skill names installed for ``assignee``'s profile.
+
+    Skill names are the directory names containing a ``SKILL.md`` under
+    ``<profile HERMES_HOME>/skills/``. Returns ``None`` when the roster
+    cannot be determined (unknown profile, no skills tree, resolver
+    error) — callers MUST treat ``None`` as "skip validation", never as
+    "no skills allowed".
+    """
+    if not assignee:
+        return None
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+        home = resolve_profile_env(str(assignee))
+    except Exception:
+        return None
+    cached = _skill_roster_cache.get(home)
+    now = time.time()
+    if cached is not None and now - cached[0] < _SKILL_ROSTER_CACHE_TTL_SECONDS:
+        return cached[1]
+    skills_dir = Path(home) / "skills"
+    if not skills_dir.is_dir():
+        return None
+    try:
+        names = frozenset(
+            md.parent.name for md in skills_dir.rglob("SKILL.md")
+        )
+    except Exception:
+        return None
+    if not names:
+        return None
+    _skill_roster_cache[home] = (now, names)
+    return names
+
+
+def validate_skills_for_assignee(
+    assignee: Optional[str], skills: "list[str]",
+) -> "tuple[list[str], list[str]]":
+    """Split ``skills`` into (available, missing) for ``assignee``'s roster.
+
+    Conservative: when the roster is unknown (see
+    :func:`_assignee_skill_roster`) everything is treated as available.
+    Disable entirely with ``HERMES_KANBAN_SKILL_VALIDATION=0``.
+    """
+    if not skills:
+        return list(skills), []
+    if os.environ.get(
+        "HERMES_KANBAN_SKILL_VALIDATION", "",
+    ).strip().lower() in ("0", "false", "no", "off"):
+        return list(skills), []
+    roster = _assignee_skill_roster(assignee)
+    if roster is None:
+        return list(skills), []
+    kept = [s for s in skills if s in roster]
+    missing = [s for s in skills if s not in roster]
+    return kept, missing
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2536,6 +2607,19 @@ def create_task(
             )
         skills_list = cleaned
 
+    # Validate against the assignee's installed skill roster at AUTHORING
+    # time. A card whose entire skill list is unknown for its assignee
+    # spawn-kills the worker at argparse (cli.py hard-fails when every
+    # requested skill is missing), which on repeat trips the breaker —
+    # 37 worker deaths on this failure shape before validation existed.
+    # Unknown names are stripped (recorded on the ``created`` event) so a
+    # decomposer typo degrades to a warning instead of a doomed spawn.
+    stripped_skills: list[str] = []
+    if skills_list:
+        skills_list, stripped_skills = validate_skills_for_assignee(
+            assignee, skills_list,
+        )
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -2677,6 +2761,9 @@ def create_task(
                         "tenant": tenant,
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
+                        "skills_stripped": (
+                            list(stripped_skills) if stripped_skills else None
+                        ),
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
@@ -3329,13 +3416,22 @@ def recompute_ready(
        exact-SHA review provides a durable route.
 
     The effective failure limit resolves in the same order as the
-    circuit breaker in ``_record_task_failure`` so the two never
-    disagree about when a task is permanently blocked:
+    circuit breaker in ``_record_task_failure``:
 
       1. per-task ``max_retries`` if set
       2. caller-supplied ``failure_limit`` (the dispatcher passes the
          ``kanban.failure_limit`` config value through ``dispatch_once``)
       3. ``DEFAULT_FAILURE_LIMIT``
+
+    The two CAN disagree when the breaker trips via an override limit
+    (systemic-fingerprint / protocol-violation fast paths pass
+    ``failure_limit=1`` — a value this function never sees). That is why
+    such trips stamp their effective limit into the task's
+    ``max_retries`` (see ``_record_task_failure(persist_limit=True)``):
+    the stamp travels through resolution step 1 and keeps this guard in
+    agreement. Before the stamp existed, every override-tripped card was
+    re-promoted here in the same dispatch tick (cf=1 < config 2) into a
+    second doomed spawn.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -3703,7 +3799,7 @@ def release_stale_claims(
         if (
             host_local
             and row["worker_pid"]
-            and _pid_alive(row["worker_pid"])
+            and _worker_alive(row["worker_pid"])
             and not heartbeat_stale
         ):
             new_expires = now + _resolve_claim_ttl_seconds()
@@ -6088,6 +6184,177 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# ---------------------------------------------------------------------------
+# Global quota-wall brake.
+#
+# When a worker dies on a provider usage/quota wall, EVERY new spawn is
+# doomed until the quota window resets — the board-wide failure mode of
+# 2026-07-11, where 23 consecutive dispatch ticks each spawned fresh
+# workers into the same wall and breaker-blocked the entire ready queue.
+# The per-task ``rate_limit_cooldown`` respawn guard can't help the OTHER
+# tasks, so the wall is recorded board-wide in ``kanban_meta`` and
+# ``dispatch_once`` spawns nothing until it expires.
+#
+# Writers: the worker itself just before exiting with the EX_TEMPFAIL
+# sentinel (cli.py calls :func:`record_rate_limit_wall_for_worker` — this
+# works even on hosts where the exit code is invisible to the dispatcher),
+# and ``detect_crashed_workers`` when it observes a rate-limited exit.
+# ---------------------------------------------------------------------------
+
+RATE_LIMIT_WALL_META_KEY = "rate_limit_wall"
+# Never honor a resets_at further out than this — a garbled timestamp must
+# not freeze the board for days.
+RATE_LIMIT_WALL_CAP_SECONDS = 6 * 3600
+
+# resets_at extraction from provider error text. Providers surface the
+# reset moment in several shapes; match epoch seconds/millis and ISO-8601.
+_RESETS_AT_EPOCH_RE = re.compile(
+    r"reset[s]?_?at[\"'\s:=]+(\d{10,13})(?:\b|\.)", re.IGNORECASE,
+)
+_RESETS_AT_ISO_RE = re.compile(
+    r"reset[s]?_?at[\"'\s:=]+"
+    r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)",
+    re.IGNORECASE,
+)
+
+
+def _parse_resets_at_from_error(text: str) -> Optional[float]:
+    """Best-effort extraction of a quota reset epoch from error text."""
+    if not text:
+        return None
+    m = _RESETS_AT_EPOCH_RE.search(text)
+    if m:
+        raw = m.group(1)
+        try:
+            val = float(raw)
+        except ValueError:
+            return None
+        if len(raw) == 13:  # milliseconds
+            val /= 1000.0
+        return val
+    m = _RESETS_AT_ISO_RE.search(text)
+    if m:
+        try:
+            from datetime import datetime, timezone
+            iso = m.group(1).replace(" ", "T").replace("Z", "+00:00")
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.astimezone()
+            return dt.timestamp()
+        except Exception:
+            return None
+    return None
+
+
+def set_rate_limit_wall(
+    conn: sqlite3.Connection,
+    *,
+    resets_at: Optional[float] = None,
+    source: str = "",
+) -> float:
+    """Record a board-wide provider quota wall; returns the wall expiry.
+
+    ``resets_at`` defaults to now + the rate-limit cooldown (min 5 min)
+    when the provider didn't say. An existing later wall is kept (walls
+    only extend, never shrink), and the expiry is capped at
+    ``RATE_LIMIT_WALL_CAP_SECONDS`` from now.
+    """
+    now = time.time()
+    if resets_at is None or resets_at <= now:
+        resets_at = now + max(
+            _resolve_rate_limit_cooldown_seconds(),
+            DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
+        )
+    resets_at = min(resets_at, now + RATE_LIMIT_WALL_CAP_SECONDS)
+    existing = get_rate_limit_wall(conn)
+    if existing is not None and existing >= resets_at:
+        return existing
+    payload = json.dumps({
+        "resets_at": resets_at,
+        "recorded_at": now,
+        "source": (source or "")[:200],
+    })
+    stmt = (
+        "INSERT INTO kanban_meta (key, value, updated_at) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+        "updated_at = excluded.updated_at"
+    )
+    args = (RATE_LIMIT_WALL_META_KEY, payload, int(now))
+    if conn.in_transaction:
+        # Caller (e.g. detect_crashed_workers) already holds a write txn.
+        conn.execute(stmt, args)
+    else:
+        with write_txn(conn):
+            conn.execute(stmt, args)
+    return resets_at
+
+
+def get_rate_limit_wall(conn: sqlite3.Connection) -> Optional[float]:
+    """Return the active quota-wall expiry (epoch), or None when clear."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM kanban_meta WHERE key = ?",
+            (RATE_LIMIT_WALL_META_KEY,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        # Table missing (pre-migration DB opened read-only elsewhere).
+        return None
+    if not row:
+        return None
+    try:
+        resets_at = float(json.loads(row["value"]).get("resets_at") or 0)
+    except Exception:
+        return None
+    if resets_at > time.time():
+        return resets_at
+    return None
+
+
+def record_rate_limit_wall_for_worker(error_text: str = "") -> Optional[float]:
+    """Worker-side wall drop: called by the kanban worker exit path in
+    cli.py just before it exits with the EX_TEMPFAIL sentinel.
+
+    Opens its own board connection (workers inherit ``HERMES_KANBAN_DB``
+    from the dispatcher, so this lands in the same DB the dispatcher
+    reads). Best-effort: returns the wall expiry or None on any failure —
+    the worker must still exit with the sentinel either way.
+    """
+    try:
+        with connect_closing() as conn:
+            return set_rate_limit_wall(
+                conn,
+                resets_at=_parse_resets_at_from_error(error_text or ""),
+                source=f"worker:{(error_text or '')[:120]}",
+            )
+    except Exception:
+        return None
+
+
+# Crash backoff: consecutive failures gate an exponential respawn delay so
+# a short provider outage can't burn a card's whole failure budget in the
+# couple of minutes the outage lasts (crash → same-tick respawn → crash →
+# breaker). 0 disables. Delay = base * 2^(consecutive_failures - 1), capped.
+DEFAULT_CRASH_BACKOFF_BASE_SECONDS = 120
+CRASH_BACKOFF_CAP_SECONDS = 1800
+
+
+def _resolve_crash_backoff_base_seconds() -> int:
+    """Read ``HERMES_KANBAN_CRASH_BACKOFF_BASE_SECONDS`` (>= 0), with
+    default fallback. 0 disables the backoff guard."""
+    raw = os.environ.get(
+        "HERMES_KANBAN_CRASH_BACKOFF_BASE_SECONDS", ""
+    ).strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_CRASH_BACKOFF_BASE_SECONDS
+
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -6142,7 +6409,9 @@ class DispatchResult:
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
-    Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
+    Reasons: ``"rate_limit_cooldown"`` (last run hit a quota wall),
+    ``"crash_backoff"`` (exponential delay after consecutive failures),
+    ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
     rate_limited: list[str] = field(default_factory=list)
@@ -6150,6 +6419,10 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    rate_limit_wall_until: Optional[float] = None
+    """When set, a board-wide provider quota wall was active this tick and
+    ALL spawning was skipped until this epoch timestamp (reclaim/promote
+    bookkeeping still ran). See :func:`set_rate_limit_wall`."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -6169,6 +6442,88 @@ class DispatchResult:
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+
+# Windows has no waitpid()-style reaping for detached children, so without
+# extra bookkeeping every worker death is indistinguishable from a vanished
+# PID ("pid N not alive") and the exit-code protections (rate-limit requeue,
+# protocol-violation classification) are unreachable. Retain each spawned
+# worker's ``Popen`` handle here (keyed by pid) so the reap tick can
+# ``poll()`` real exit codes. Holding the process handle open has a second
+# benefit: the kernel keeps the process object (and therefore the PID)
+# reserved until the handle is released, so a retained pid can NOT be
+# recycled by an unrelated process — which is what makes handle-first
+# liveness checks immune to PID-reuse false positives.
+#
+# Exited entries are retained until their exit record ages out of
+# ``_recent_worker_exits`` (same TTL) so same-tick and next-tick liveness
+# checks can still consult the handle, then dropped. The registry is
+# per-process: a dispatcher running in a different process from the spawner
+# simply finds no entry and falls back to today's behavior.
+_windows_worker_procs: "dict[int, object]" = {}
+
+
+def _register_worker_proc(proc) -> None:
+    """Retain a spawned worker's Popen handle for exit-code capture (Windows).
+
+    No-op on POSIX (waitpid reaping already covers it) and for procs
+    without a usable pid.
+    """
+    if os.name != "nt" or proc is None:
+        return
+    pid = getattr(proc, "pid", None)
+    if not pid or pid <= 0:
+        return
+    _windows_worker_procs[int(pid)] = proc
+
+
+def _reap_windows_workers() -> "list[int]":
+    """Poll retained worker handles and record exits (Windows counterpart
+    of the POSIX ``waitpid`` loop in :func:`reap_worker_zombies`).
+
+    Returns the list of pids whose exit was newly recorded this call.
+    Exited handles are kept until their ``_recent_worker_exits`` record
+    ages out (see registry comment above), then released.
+    """
+    reaped: "list[int]" = []
+    now = time.time()
+    for pid, proc in list(_windows_worker_procs.items()):
+        try:
+            rc = proc.poll()
+        except Exception:
+            _windows_worker_procs.pop(pid, None)
+            continue
+        if rc is None:
+            continue
+        entry = _recent_worker_exits.get(pid)
+        if entry is None:
+            _record_worker_exit(pid, int(rc))
+            reaped.append(pid)
+        else:
+            _, recorded_at = entry
+            if now - recorded_at > _RECENT_WORKER_EXIT_TTL_SECONDS:
+                _windows_worker_procs.pop(pid, None)
+    return reaped
+
+
+def _worker_alive(pid: Optional[int]) -> bool:
+    """Liveness check that prefers the retained process handle on Windows.
+
+    A retained handle's ``poll()`` is authoritative: it cannot confuse a
+    dead worker with an unrelated process that recycled its PID (the open
+    handle also prevents the recycle outright). Falls back to
+    :func:`_pid_alive` when no handle is retained (POSIX, or a dispatcher
+    process that didn't spawn this worker).
+    """
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        proc = _windows_worker_procs.get(int(pid))
+        if proc is not None:
+            try:
+                return proc.poll() is None
+            except Exception:
+                pass
+    return _pid_alive(pid)
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -6219,9 +6574,32 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     for ``unknown``.
     """
     entry = _recent_worker_exits.get(int(pid))
+    if entry is None and os.name == "nt":
+        # Callers that reach classification without a reap tick first
+        # (e.g. a watcher invoking ``detect_crashed_workers`` directly)
+        # can still learn the exit code straight from the retained handle.
+        proc = _windows_worker_procs.get(int(pid))
+        if proc is not None:
+            try:
+                rc = proc.poll()
+            except Exception:
+                rc = None
+            if rc is not None:
+                _record_worker_exit(pid, int(rc))
+                entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
     raw, _ = entry
+    if os.name == "nt":
+        # On Windows the registry stores ``Popen.returncode`` directly
+        # (recorded by ``_reap_windows_workers``) — there is no waitpid
+        # raw-status encoding and no signal semantics.
+        code = int(raw)
+        if code == 0:
+            return ("clean_exit", 0)
+        if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+            return ("rate_limited", code)
+        return ("nonzero_exit", code)
     try:
         if os.WIFEXITED(raw):
             code = os.WEXITSTATUS(raw)
@@ -6241,8 +6619,15 @@ def reap_worker_zombies() -> "list[int]":
     """Reap all zombie children of this process without blocking.
 
     Returns the list of reaped PIDs. Safe to call when there are no
-    children (returns []). No-op on Windows.
+    children (returns []). On Windows there are no zombies to reap;
+    instead this polls the retained worker handles so exit codes are
+    captured (see :func:`_reap_windows_workers`).
     """
+    if os.name == "nt":
+        try:
+            return _reap_windows_workers()
+        except Exception:
+            return []
     reaped: "list[int]" = []
     if os.name != "nt":
         try:
@@ -6811,7 +7196,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 grace = _resolve_crash_grace_seconds()
                 if time.time() - started_at < grace:
                     continue
-            if _pid_alive(row["worker_pid"]):
+            if _worker_alive(row["worker_pid"]):
                 continue
 
             pid = int(row["worker_pid"])
@@ -6901,6 +7286,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                    # A quota wall is board-wide, not per-task: record the
+                    # global brake so this tick (and following ticks) stop
+                    # spawning fresh workers into the same wall.
+                    try:
+                        set_rate_limit_wall(
+                            conn, source=f"exit75:{row['id']}",
+                        )
+                    except Exception:
+                        pass
                 else:
                     crashed.append(row["id"])
                     crash_details.append(
@@ -6938,6 +7332,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
+                # Override trips must persist their limit or
+                # ``recompute_ready`` (which only knows the config limit)
+                # re-promotes the card this same tick into a doomed spawn.
+                persist_limit=bool(protocol_violation or is_systemic),
             )
             if tripped:
                 auto_blocked.append(tid)
@@ -6962,9 +7360,22 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    persist_limit: bool = False,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
+
+    ``persist_limit=True`` marks the caller's ``failure_limit`` as an
+    OVERRIDE of the board config (the systemic-fingerprint and
+    protocol-violation fast paths pass 1). When such a trip fires and the
+    task has no ``max_retries`` of its own, the effective limit is stamped
+    into the task's ``max_retries`` so every later reader —
+    ``recompute_ready`` in particular, which only knows the config limit —
+    agrees the task is at its limit. Without the stamp,
+    ``recompute_ready`` re-promoted override-tripped cards in the same
+    dispatch tick (cf=1 < config 2) straight into a second doomed spawn,
+    inverting the protection (the 2026-07-11 cascade burned exactly two
+    spawns on every "protected" card this way).
 
     Unified replacement for the old spawn-only ``_record_spawn_failure``.
     Every path that ends a task with a non-success outcome funnels
@@ -7024,14 +7435,27 @@ def _record_task_failure(
 
         if failures >= effective_limit:
             # Trip the breaker.
+            #
+            # Override trips (persist_limit) stamp the effective limit into
+            # ``max_retries`` so ``recompute_ready`` — which resolves the
+            # limit independently from the config value — cannot disagree
+            # and re-promote the card this same tick. See docstring.
+            stamp_limit = (
+                persist_limit and task_override is None
+            )
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "max_retries = COALESCE(?, max_retries) "
                     "WHERE id = ? AND status IN ('running', 'ready')",
-                    (failures, error[:500], task_id),
+                    (
+                        failures, error[:500],
+                        effective_limit if stamp_limit else None,
+                        task_id,
+                    ),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready``
@@ -7039,9 +7463,14 @@ def _record_task_failure(
                 # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "max_retries = COALESCE(?, max_retries) "
                     "WHERE id = ? AND status IN ('ready', 'running')",
-                    (failures, error[:500], task_id),
+                    (
+                        failures, error[:500],
+                        effective_limit if stamp_limit else None,
+                        task_id,
+                    ),
                 )
             run_id = None
             if end_run:
@@ -7064,6 +7493,8 @@ def _record_task_failure(
                 "error": error[:500],
                 "trigger_outcome": outcome,
             }
+            if stamp_limit:
+                payload["max_retries_stamped"] = effective_limit
             if event_payload_extra:
                 payload.update(event_payload_extra)
             _append_event(
@@ -7188,6 +7619,14 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         never increments ``consecutive_failures``, so the breaker can't free
         it). Once the cooldown elapses the task falls through and respawns.
 
+    ``"crash_backoff"``
+        The task's most recent run failed (``crashed`` / ``spawn_failed``
+        / ``timed_out``) and ``consecutive_failures`` gates an exponential
+        respawn delay (``HERMES_KANBAN_CRASH_BACKOFF_BASE_SECONDS`` *
+        2^(cf-1), capped at ``CRASH_BACKOFF_CAP_SECONDS``). Prevents a
+        provider outage shorter than the dispatch interval from burning a
+        card's whole failure budget via instant respawns.
+
     ``"blocker_auth"``
         The task's last failure error matches a quota / authentication
         pattern. Retrying immediately is unlikely to help (rate limits
@@ -7209,6 +7648,9 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        Bypassed when an explicit re-queue event (status change, promote,
+        unblock, reclaim) arrives AFTER the newest PR-URL comment — that's
+        a deliberate re-run request, same as the ``recent_success`` bypass.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -7216,7 +7658,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, consecutive_failures FROM tasks "
+        "WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -7260,6 +7703,27 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         # crash/completion supersedes it.
         return None
 
+    # 1.5 Crash backoff: after a failed run, wait base * 2^(cf-1) seconds
+    #     (capped) before re-spawning. Without this, crash → same-tick
+    #     respawn → crash burns a card's whole failure budget inside a
+    #     provider outage shorter than the dispatch interval — on
+    #     2026-07-11 a ~22-minute outage breaker-blocked the entire ready
+    #     queue at 2 spawns/card/2-minutes.
+    backoff_base = _resolve_crash_backoff_base_seconds()
+    cf = int(row["consecutive_failures"] or 0)
+    if (
+        backoff_base > 0
+        and cf > 0
+        and latest_run is not None
+        and latest_run["outcome"] in ("crashed", "spawn_failed", "timed_out")
+        and latest_run["ended_at"] is not None
+    ):
+        delay = min(
+            backoff_base * (2 ** (cf - 1)), CRASH_BACKOFF_CAP_SECONDS,
+        )
+        if (now - int(latest_run["ended_at"])) < delay:
+            return "crash_backoff"
+
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
@@ -7291,12 +7755,57 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    Exception (mirrors guard 3): an explicit re-queue AFTER the newest
+    #    PR-URL comment is a deliberate "run it again". PR-steward cards
+    #    (refresh/remediate/un-draft lanes) cite their PR in nearly every
+    #    comment, so without this bypass a park→release or block→unblock
+    #    freezes the lane for the full 24h window — on 2026-07-12 this
+    #    stalled merge-eligible PRs at the un-draft hand-off for hours.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    latest_pr_comment_at = None
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            at = int(c["created_at"] or 0)
+            if latest_pr_comment_at is None or at > latest_pr_comment_at:
+                latest_pr_comment_at = at
+    if latest_pr_comment_at is not None:
+        # Strict ``>``: comments and events share integer-second clocks, so a
+        # ``>=`` would count a pre-comment event in the same second as
+        # "after" and silently bypass. Fail closed on the tie.
+        requeue_rows = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND created_at > ? "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed')",
+            (task_id, latest_pr_comment_at),
+        ).fetchall()
+        requeued_after = False
+        for ev in requeue_rows:
+            if ev["kind"] == "reclaimed":
+                # ``release_stale_claims()`` also emits ``reclaimed`` when a
+                # worker dies or its claim expires — the exact
+                # crash-after-opening-a-PR case this guard suppresses. Only
+                # an operator-driven ``reclaim_task()`` (payload
+                # ``{"manual": true}``) is a deliberate re-run request.
+                # Fail closed on anything else: the literal JSON boolean is
+                # required (truthy strings don't count), and malformed or
+                # non-object payloads must never crash the dispatch path.
+                try:
+                    payload = json.loads(ev["payload"] or "{}")
+                    manual = (
+                        isinstance(payload, dict)
+                        and payload.get("manual") is True
+                    )
+                except Exception:
+                    manual = False
+                if not manual:
+                    continue
+            requeued_after = True
+            break
+        if not requeued_after:
             return "active_pr"
 
     return None
@@ -7495,6 +8004,18 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+
+    # Global quota-wall brake: when a worker recently died on a provider
+    # usage/quota wall, every new spawn is doomed until the window resets.
+    # Reclaim/promote bookkeeping above still ran; just spawn nothing.
+    wall_until = None
+    try:
+        wall_until = get_rate_limit_wall(conn)
+    except Exception:
+        wall_until = None
+    if wall_until is not None:
+        result.rate_limit_wall_until = wall_until
+        return result
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -8283,6 +8804,11 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    #
+    # On Windows the Popen handle is the ONLY way to ever learn this
+    # worker's exit code (no waitpid for detached children), so retain it
+    # for the reap tick instead of abandoning it.
+    _register_worker_proc(proc)
     return proc.pid
 
 

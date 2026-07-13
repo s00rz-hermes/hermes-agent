@@ -29,6 +29,14 @@ from hermes_cli.kanban import run_slash
 # Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _no_crash_backoff(monkeypatch):
+    """These tests assert immediate-retry circuit-breaker mechanics; the
+    crash-backoff respawn guard (HERMES_KANBAN_CRASH_BACKOFF_BASE_SECONDS,
+    default 120s * 2^(cf-1)) would defer the very retries they exercise."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_BACKOFF_BASE_SECONDS", "0")
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
