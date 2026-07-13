@@ -872,7 +872,13 @@ def test_resolve_crash_grace_seconds_handles_bad_env(monkeypatch):
 
 
 def _exited_status(code: int) -> int:
-    """Raw wait-status for a WIFEXITED child with the given exit code."""
+    """Recorded exit status for a child with the given exit code.
+
+    POSIX records the raw wait status (WIFEXITED encoding); Windows
+    records ``Popen.returncode`` directly (see ``_reap_windows_workers``).
+    """
+    if os.name == "nt":
+        return code
     return code << 8
 
 
@@ -979,6 +985,421 @@ def test_real_crash_still_counts_and_trips_breaker(kanban_home, monkeypatch):
         assert task.status == "blocked", (
             f"genuine crashes should still trip the breaker, got {task.status}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Windows exit-code capture: retained Popen handles make worker exit codes
+# visible on nt, where there is no waitpid()-style reaping. Without this,
+# every worker death is an opaque "pid N not alive" crash and the
+# rate-limit-requeue / protocol-violation protections are dead code.
+# ---------------------------------------------------------------------------
+
+_windows_only = pytest.mark.skipif(
+    os.name != "nt", reason="Windows-only exit-code capture path"
+)
+
+
+class _FakeProc:
+    """Stand-in for a spawned worker's Popen handle."""
+
+    def __init__(self, pid: int, rc=None):
+        self.pid = pid
+        self._rc = rc
+
+    def poll(self):
+        return self._rc
+
+    def exit(self, rc: int) -> None:
+        self._rc = rc
+
+
+@pytest.fixture
+def clean_worker_registry():
+    kb._windows_worker_procs.clear()
+    kb._recent_worker_exits.clear()
+    yield
+    kb._windows_worker_procs.clear()
+    kb._recent_worker_exits.clear()
+
+
+@_windows_only
+def test_windows_reap_records_real_exit_codes(clean_worker_registry):
+    running = _FakeProc(41000, rc=None)
+    rate_limited = _FakeProc(41001, rc=kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    clean = _FakeProc(41002, rc=0)
+    failed = _FakeProc(41003, rc=1)
+    for p in (running, rate_limited, clean, failed):
+        kb._register_worker_proc(p)
+
+    reaped = kb.reap_worker_zombies()
+    assert sorted(reaped) == [41001, 41002, 41003]
+
+    assert kb._classify_worker_exit(41001) == (
+        "rate_limited", kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+    )
+    assert kb._classify_worker_exit(41002) == ("clean_exit", 0)
+    assert kb._classify_worker_exit(41003) == ("nonzero_exit", 1)
+    # Still-running worker: nothing recorded, classification stays unknown.
+    assert kb._classify_worker_exit(41000) == ("unknown", None)
+
+    # A second reap does not double-record already-reaped exits.
+    assert kb.reap_worker_zombies() == []
+
+
+@_windows_only
+def test_windows_classify_falls_back_to_retained_handle(clean_worker_registry):
+    # A caller that reaches classification without a reap tick first (e.g.
+    # a watcher calling detect_crashed_workers directly) still gets the
+    # real exit code straight from the retained handle.
+    proc = _FakeProc(42000, rc=kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+    kb._register_worker_proc(proc)
+    assert kb._classify_worker_exit(42000) == (
+        "rate_limited", kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+    )
+
+
+@_windows_only
+def test_windows_worker_alive_defeats_pid_reuse(
+    clean_worker_registry, monkeypatch,
+):
+    # The pid LOOKS alive (recycled by an unrelated process), but the
+    # retained handle knows the worker exited — handle wins.
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    proc = _FakeProc(43000, rc=None)
+    kb._register_worker_proc(proc)
+    assert kb._worker_alive(43000) is True
+    proc.exit(1)
+    assert kb._worker_alive(43000) is False
+    # No retained handle → fall back to the pid probe (today's behavior).
+    assert kb._worker_alive(43999) is True
+
+
+@_windows_only
+def test_windows_exited_handles_released_after_ttl(
+    clean_worker_registry, monkeypatch,
+):
+    proc = _FakeProc(44000, rc=0)
+    kb._register_worker_proc(proc)
+    kb.reap_worker_zombies()
+    assert 44000 in kb._windows_worker_procs
+
+    # Past the exit-record TTL the handle is dropped, releasing the pid.
+    real_time = time.time()
+    monkeypatch.setattr(
+        kb.time, "time",
+        lambda: real_time + kb._RECENT_WORKER_EXIT_TTL_SECONDS + 61,
+    )
+    kb.reap_worker_zombies()
+    assert 44000 not in kb._windows_worker_procs
+
+
+@_windows_only
+def test_windows_rate_limit_exit_requeues_via_detect_crashed_workers(
+    kanban_home, clean_worker_registry, monkeypatch,
+):
+    """End-to-end on nt: a registered worker that exits with the rate-limit
+    sentinel is requeued to ``ready`` without counting a failure — the
+    protection that was dead code while exit codes were invisible."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="nt-rl", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+
+        proc = _FakeProc(45000, rc=None)
+        kb._register_worker_proc(proc)
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (45000, tid),
+        )
+        conn.commit()
+
+        # Worker dies on a quota wall; the pid probe would say "not alive".
+        proc.exit(kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        kb.reap_worker_zombies()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed
+        assert tid in getattr(
+            kb.detect_crashed_workers, "_last_rate_limited", [],
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+
+
+@_windows_only
+def test_windows_protocol_violation_classified_via_handle(
+    kanban_home, clean_worker_registry, monkeypatch,
+):
+    """End-to-end on nt: a clean exit (rc=0) with the task still running is
+    classified as a protocol violation instead of an opaque crash."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="nt-pv", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+
+        proc = _FakeProc(46000, rc=0)
+        kb._register_worker_proc(proc)
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (46000, tid),
+        )
+        conn.commit()
+        kb.reap_worker_zombies()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid in crashed
+        run = conn.execute(
+            "SELECT error FROM task_runs WHERE task_id=? "
+            "ORDER BY id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        assert "protocol violation" in (run["error"] or "")
+
+
+# ---------------------------------------------------------------------------
+# Breaker override-limit persistence: a systemic/protocol trip at
+# failure_limit=1 must not be re-promoted by recompute_ready (which only
+# knows the config limit) in the same tick. Regression for the 2026-07-11
+# cascade where every "protected" card burned a second doomed spawn.
+# ---------------------------------------------------------------------------
+
+
+def test_override_trip_persists_limit_and_blocks_repromotion(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="systemic", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET status='ready' WHERE id=?", (tid,),
+        )
+        conn.commit()
+
+        tripped = _kb._record_task_failure(
+            conn, tid,
+            error="pid 123 not alive",
+            outcome="crashed",
+            failure_limit=1,          # systemic fast-path override
+            persist_limit=True,
+        )
+        assert tripped is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 1
+        # The override limit is stamped so all later readers agree.
+        assert task.max_retries == 1
+
+        # The bug: recompute_ready with the CONFIG limit (2) used to see
+        # cf=1 < 2 and re-promote the card the same tick.
+        promoted = kb.recompute_ready(conn, failure_limit=2)
+        assert promoted == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_normal_trip_does_not_stamp_max_retries(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="normal", assignee="a")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        conn.commit()
+        for _ in range(2):
+            _kb._record_task_failure(
+                conn, tid,
+                error="boom", outcome="crashed", failure_limit=2,
+            )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 2
+        assert task.max_retries is None  # config-limit trips leave it alone
+
+
+def test_existing_task_max_retries_not_overwritten_by_override_trip(
+    kanban_home,
+):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="pinned", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET status='ready', max_retries=5, "
+            "consecutive_failures=4 WHERE id=?", (tid,),
+        )
+        conn.commit()
+        _kb._record_task_failure(
+            conn, tid,
+            error="boom", outcome="crashed", failure_limit=1,
+            persist_limit=True,
+        )
+        # Per-task max_retries already won resolution; it must not be
+        # clobbered by the override stamp.
+        assert kb.get_task(conn, tid).max_retries == 5
+
+
+# ---------------------------------------------------------------------------
+# Global quota-wall brake
+# ---------------------------------------------------------------------------
+
+
+def test_rate_limit_wall_roundtrip_and_extend_only(kanban_home):
+    with kb.connect() as conn:
+        assert kb.get_rate_limit_wall(conn) is None
+        until = kb.set_rate_limit_wall(conn, source="test")
+        assert until > time.time()
+        assert kb.get_rate_limit_wall(conn) == pytest.approx(until, abs=1)
+
+        # Walls only extend — an earlier resets_at is ignored.
+        sooner = time.time() + 30
+        kept = kb.set_rate_limit_wall(conn, resets_at=sooner, source="t2")
+        assert kept == pytest.approx(until, abs=1)
+
+        later = time.time() + 900
+        extended = kb.set_rate_limit_wall(conn, resets_at=later, source="t3")
+        assert extended == pytest.approx(later, abs=1)
+
+        # A garbled far-future resets_at is capped.
+        capped = kb.set_rate_limit_wall(
+            conn, resets_at=time.time() + 999999, source="t4",
+        )
+        assert capped <= time.time() + kb.RATE_LIMIT_WALL_CAP_SECONDS + 1
+
+
+def test_expired_rate_limit_wall_reads_as_clear(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        kb.set_rate_limit_wall(conn, resets_at=time.time() + 60)
+        real_time = time.time
+        monkeypatch.setattr(kb.time, "time", lambda: real_time() + 120)
+        assert kb.get_rate_limit_wall(conn) is None
+
+
+def test_dispatch_skips_all_spawns_while_wall_active(kanban_home, monkeypatch):
+    import hermes_cli.profiles as _profiles
+
+    monkeypatch.setattr(_profiles, "profile_exists", lambda _name: True)
+    spawned = []
+
+    def _stub_spawn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 12345
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="doomed", assignee="a")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        conn.commit()
+
+        kb.set_rate_limit_wall(conn, resets_at=time.time() + 300)
+        result = kb.dispatch_once(conn, spawn_fn=_stub_spawn)
+        assert result.rate_limit_wall_until is not None
+        assert spawned == []
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # Clear the wall → the same card spawns normally.
+        conn.execute(
+            "DELETE FROM kanban_meta WHERE key=?",
+            (kb.RATE_LIMIT_WALL_META_KEY,),
+        )
+        conn.commit()
+        result = kb.dispatch_once(conn, spawn_fn=_stub_spawn)
+        assert result.rate_limit_wall_until is None
+        assert spawned == [tid]
+
+
+def test_rate_limited_exit_records_global_wall(kanban_home, monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="wall", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (77000, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(
+            77000, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE),
+        )
+        kb.detect_crashed_workers(conn)
+        assert kb.get_rate_limit_wall(conn) is not None
+
+
+def test_worker_side_wall_drop_uses_env_pinned_db(kanban_home, monkeypatch):
+    # Workers inherit HERMES_KANBAN_DB from the dispatcher; the wall they
+    # drop must land in that DB.
+    monkeypatch.setenv(
+        "HERMES_KANBAN_DB", str(kb.kanban_db_path()),
+    )
+    until = kb.record_rate_limit_wall_for_worker(
+        "usage_limit_reached resets_at=%d" % int(time.time() + 1200),
+    )
+    assert until is not None
+    with kb.connect() as conn:
+        assert kb.get_rate_limit_wall(conn) == pytest.approx(until, abs=1)
+
+
+# ---------------------------------------------------------------------------
+# Crash backoff
+# ---------------------------------------------------------------------------
+
+
+def test_crash_backoff_defers_respawn_then_releases(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="backoff", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (78000, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(78000, _exited_status(1))
+        kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1
+
+        # Fresh crash → deferred by the exponential backoff.
+        assert kb.check_respawn_guard(conn, tid) == "crash_backoff"
+
+        # Once the delay elapses the guard releases.
+        base = _kb._resolve_crash_backoff_base_seconds()
+        real_time = time.time
+        monkeypatch.setattr(
+            _kb.time, "time", lambda: real_time() + base + 1,
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_crash_backoff_disabled_via_env(kanban_home, monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_BACKOFF_BASE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="nobackoff", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (79000, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(79000, _exited_status(1))
+        kb.detect_crashed_workers(conn)
+        assert kb.check_respawn_guard(conn, tid) is None
 
 
 def test_respawn_guard_defers_rate_limited_within_cooldown(
@@ -1879,6 +2300,30 @@ def test_respawn_guard_recent_success(kanban_home):
     assert reason == "recent_success"
 
 
+def test_respawn_guard_recent_success_bypassed_by_requeue(kanban_home):
+    """An explicit re-queue after a recent success (operator done->ready,
+    promote, unblock, reclaim) is a deliberate re-run and must bypass the
+    recent_success guard — otherwise a manual done->ready just sits there
+    until the window elapses."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="rerun-me", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+        # Baseline: a recent completion defers the respawn.
+        assert kb.check_respawn_guard(conn, t) == "recent_success"
+        # Operator drags done -> ready: a 'status' event after completion.
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'status', ?)",
+            (t, now - 10),
+        )
+        assert kb.check_respawn_guard(conn, t) is None
+
+
 def test_respawn_guard_stale_success_not_guarded(kanban_home):
     """A completed run outside the guard window does not block re-spawn."""
     with kb.connect() as conn:
@@ -2015,6 +2460,176 @@ def test_dispatch_respawn_guard_skips_active_pr(
         assert kb.get_task(conn, t).status == "ready"
 
 
+def test_dispatch_respawn_guard_active_pr_bypassed_by_requeue(
+    kanban_home, all_assignees_spawnable
+):
+    """An explicit re-queue event after the newest PR-URL comment bypasses active_pr.
+
+    PR-steward cards (refresh/remediate/un-draft lanes) cite their PR in
+    nearly every comment; a park->release or block->unblock is a deliberate
+    "run it again" and must not freeze the lane for the 24h guard window.
+    """
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="pr-steward", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Refreshed https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        # Explicit re-queue AFTER the PR-URL comment (e.g. unblock).
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, int(time.time()) + 1),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") not in res.respawn_guarded
+    assert t in spawned_ids
+
+
+def test_dispatch_respawn_guard_active_pr_not_bypassed_by_auto_reclaim(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """Automatic stale-claim recovery must NOT bypass active_pr.
+
+    ``release_stale_claims()`` emits ``reclaimed`` when a worker dies or its
+    claim expires — the crash-after-opening-a-PR case guard 4 suppresses.
+    Drives the real producer path, not a synthetic event.
+    """
+    import hermes_cli.kanban_db as _kb
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="crashed-pr-owner", assignee="alice")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        # Backdate the comment so the auto-reclaim event lands strictly
+        # after it (integer-second clocks would otherwise tie).
+        conn.execute(
+            "UPDATE task_comments SET created_at = created_at - 5 "
+            "WHERE task_id = ?",
+            (t,),
+        )
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 3600, t),
+        )
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        assert kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None) == 1
+        assert kb.get_task(conn, t).status == "ready"
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") in res.respawn_guarded
+    assert t not in spawned_ids
+
+
+def test_dispatch_respawn_guard_active_pr_requires_literal_manual_true(
+    kanban_home, all_assignees_spawnable
+):
+    """Only the literal JSON boolean true bypasses; truthy strings do not,
+    and a non-object payload neither bypasses nor crashes dispatch."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        for payload in ('{"manual": "false"}', '{"manual": 1}', '[]', 'null'):
+            t = kb.create_task(conn, title=f"pr-{payload[:6]}", assignee="alice")
+            kb.add_comment(
+                conn, t, "worker",
+                "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+            )
+            conn.execute(
+                "UPDATE task_comments SET created_at = created_at - 5 "
+                "WHERE task_id = ?",
+                (t,),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'reclaimed', ?, ?)",
+                (t, payload, int(time.time()) + 1),
+            )
+            res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+            assert (t, "active_pr") in res.respawn_guarded, payload
+            assert t not in spawned_ids, payload
+
+
+def test_dispatch_respawn_guard_active_pr_bypassed_by_manual_reclaim(
+    kanban_home, all_assignees_spawnable
+):
+    """An operator-driven ``reclaim_task()`` (payload manual=true) bypasses."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="operator-rerun", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        conn.execute(
+            "UPDATE task_comments SET created_at = created_at - 5 "
+            "WHERE task_id = ?",
+            (t,),
+        )
+        kb.claim_task(conn, t)
+        assert kb.reclaim_task(conn, t, reason="operator rerun",
+                               signal_fn=lambda _p, _s: None)
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") not in res.respawn_guarded
+    assert t in spawned_ids
+
+
+def test_dispatch_respawn_guard_active_pr_same_second_event_fails_closed(
+    kanban_home, all_assignees_spawnable
+):
+    """A re-queue event in the SAME second as the PR comment does not bypass.
+
+    Comments and events share integer-second clocks; a >= comparison would
+    treat a pre-comment same-second event as "after". Strict > fails closed.
+    """
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="same-second", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        row = conn.execute(
+            "SELECT created_at FROM task_comments WHERE task_id = ?", (t,)
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, row["created_at"]),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") in res.respawn_guarded
+    assert t not in spawned_ids
+
+
 def test_dispatch_respawn_guard_dry_run_no_auto_block(
     kanban_home, all_assignees_spawnable
 ):
@@ -2072,6 +2687,32 @@ def test_dispatch_respawn_guard_emits_event_for_skipped_task(
     # Event.payload is already parsed as a dict by list_events.
     assert isinstance(guarded_evt.payload, dict)
     assert guarded_evt.payload.get("reason") == "recent_success"
+
+
+def test_dispatch_respawn_guard_coalesces_repeated_events(
+    kanban_home, all_assignees_spawnable
+):
+    """A persistent guard remains observable without an event every tick."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="guarded PR", assignee="alice")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "Opened https://github.com/acme/widgets/pull/42",
+        )
+
+        first = kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        second = kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        guarded_events = [
+            event
+            for event in kb.list_events(conn, t)
+            if event.kind == "respawn_guarded"
+        ]
+
+    assert (t, "active_pr") in first.respawn_guarded
+    assert (t, "active_pr") in second.respawn_guarded
+    assert len(guarded_events) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -3671,6 +4312,501 @@ def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> Non
     conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
 
 
+def test_not_clean_review_routes_same_pr_remediation_and_exact_sha_rereview(
+    kanban_home,
+):
+    """A NOT CLEAN parent review must never re-spawn its PR-bearing producer."""
+    pr_url = "https://github.com/acme/widgets/pull/42"
+    reviewed_sha = "a" * 40
+    replacement_sha = "b" * 40
+
+    with kb.connect() as conn:
+        producer = kb.create_task(
+            conn,
+            title="Implement widget telemetry",
+            body="Preserve low-cardinality telemetry and legal recovery transitions.",
+            assignee="author",
+            tenant="acme",
+            priority=50,
+        )
+        kb.add_comment(
+            conn,
+            producer,
+            "author",
+            f"Draft PR {pr_url}; branch feature/widget-telemetry; head {reviewed_sha}",
+        )
+        reviewer = kb.create_task(
+            conn,
+            title="Exact-SHA review of widget telemetry",
+            assignee="reviewer",
+            tenant="acme",
+        )
+        kb.link_tasks(conn, reviewer, producer)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            summary="Verdict: NOT CLEAN",
+            metadata={
+                "verdict": "NOT CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": reviewed_sha,
+                "findings": [
+                    {
+                        "severity": "high",
+                        "file": "widget.py",
+                        "line": 17,
+                        "issue": "retry path can duplicate events",
+                    }
+                ],
+            },
+        )
+
+        # A duplicate completion delivery is harmless and cannot fan out a
+        # second remediation/re-review pair.
+        assert not kb.complete_task(
+            conn,
+            reviewer,
+            summary="Verdict: NOT CLEAN",
+            metadata={
+                "verdict": "NOT CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": reviewed_sha,
+            },
+        )
+
+        remediation = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key = ?",
+            (f"review-remediation:{producer}:{reviewed_sha}",),
+        ).fetchall()
+        rereviews = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key = ?",
+            (f"review-rereview:{producer}:{reviewed_sha}",),
+        ).fetchall()
+
+        assert len(remediation) == 1
+        assert len(rereviews) == 1
+        remediation = remediation[0]
+        rereview = rereviews[0]
+        assert remediation["assignee"] == "author"
+        assert remediation["status"] == "ready"
+        assert rereview["assignee"] == "reviewer"
+        assert rereview["status"] == "todo"
+        assert pr_url in remediation["body"]
+        assert reviewed_sha in remediation["body"]
+        assert "same branch" in remediation["body"].lower()
+        assert "do not open" in remediation["body"].lower()
+        assert "Original producer requirements" in remediation["body"]
+        assert "Preserve low-cardinality telemetry" in remediation["body"]
+        assert pr_url in rereview["body"]
+        assert "replacement_sha" in rereview["body"]
+
+        remediation_parents = {
+            row["parent_id"]
+            for row in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?",
+                (remediation["id"],),
+            )
+        }
+        rereview_parents = {
+            row["parent_id"]
+            for row in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?",
+                (rereview["id"],),
+            )
+        }
+        producer_parents = {
+            row["parent_id"]
+            for row in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?",
+                (producer,),
+            )
+        }
+        assert remediation_parents == {reviewer}
+        assert rereview_parents == {remediation["id"]}
+        assert producer_parents == {reviewer, rereview["id"]}
+        assert kb.get_task(conn, producer).status == "todo"
+
+        assert kb.complete_task(
+            conn,
+            remediation["id"],
+            summary=f"Remediated same PR at {replacement_sha}",
+            metadata={
+                "pr_url": pr_url,
+                "replacement_sha": replacement_sha,
+                "branch": "feature/widget-telemetry",
+            },
+        )
+        assert kb.get_task(conn, rereview["id"]).status == "ready"
+        assert kb.get_task(conn, producer).status == "todo"
+
+        assert kb.complete_task(
+            conn,
+            rereview["id"],
+            summary="Verdict: CLEAN",
+            metadata={
+                "verdict": "CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": replacement_sha,
+                "reviewer_identity": "reviewer",
+            },
+        )
+        assert kb.get_task(conn, producer).status == "done"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE ?",
+            (f"review-%:{producer}:%",),
+        ).fetchone()[0] == 2
+
+
+def test_rereview_mismatched_replacement_sha_fails_closed(kanban_home):
+    """A re-review cannot close its producer at an unrelated full SHA."""
+    pr_url = "https://github.com/acme/widgets/pull/44"
+    reviewed_sha = "a" * 40
+    replacement_sha = "b" * 40
+    mismatched_sha = "c" * 40
+
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            metadata={
+                "verdict": "NOT CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": reviewed_sha,
+                "findings": [],
+            },
+        )
+        remediation = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key = ?",
+            (f"review-remediation:{producer}:{reviewed_sha}",),
+        ).fetchone()
+        rereview = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key = ?",
+            (f"review-rereview:{producer}:{reviewed_sha}",),
+        ).fetchone()
+        assert remediation is not None
+        assert rereview is not None
+
+        assert kb.complete_task(
+            conn,
+            remediation["id"],
+            metadata={"pr_url": pr_url, "replacement_sha": replacement_sha},
+        )
+        assert kb.complete_task(
+            conn,
+            rereview["id"],
+            metadata={
+                "verdict": "CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": mismatched_sha,
+            },
+        )
+
+        assert kb.get_task(conn, producer).status == "todo"
+        assert not any(
+            event.kind == "review_approved"
+            for event in kb.list_events(conn, producer)
+        )
+        deferred = [
+            event
+            for event in kb.list_events(conn, rereview["id"])
+            if event.kind == "review_routing_deferred"
+        ]
+        assert len(deferred) == 1
+        assert deferred[0].payload == {
+            "review_task_id": rereview["id"],
+            "verdict": "CLEAN",
+            "pr_url": pr_url,
+            "reviewed_sha": mismatched_sha,
+            "reason": "missing_or_mismatched_review_evidence",
+        }
+
+
+def test_rereview_unfinished_remediation_parent_fails_closed_on_manual_completion(
+    kanban_home,
+):
+    """An unfinished router remediation parent cannot be bypassed manually."""
+    pr_url = "https://github.com/acme/widgets/pull/45"
+    reviewed_sha = "d" * 40
+
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        remediation = kb.create_task(
+            conn,
+            title="Remediate producer after NOT CLEAN review",
+            body=(
+                f"Work on the same PR {pr_url}; complete with a full "
+                "40-character replacement_sha."
+            ),
+            assignee="author",
+            created_by="kanban-review-router",
+        )
+        rereview = kb.create_task(
+            conn,
+            title="Re-review producer after remediation",
+            body=(
+                f"Independently re-review the same PR {pr_url}. Require the "
+                f"remediation parent {remediation} handoff and its replacement_sha."
+            ),
+            assignee="reviewer",
+            created_by="kanban-review-router",
+        )
+        kb.link_tasks(conn, remediation, rereview)
+        kb.link_tasks(conn, rereview, producer)
+        _set_task_status(conn, rereview, "blocked")
+
+        assert kb.complete_task(
+            conn,
+            rereview,
+            metadata={
+                "verdict": "CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": reviewed_sha,
+            },
+        )
+
+        assert kb.get_task(conn, producer).status == "todo"
+        assert not any(
+            event.kind == "review_approved"
+            for event in kb.list_events(conn, producer)
+        )
+        deferred = [
+            event
+            for event in kb.list_events(conn, rereview)
+            if event.kind == "review_routing_deferred"
+        ]
+        assert len(deferred) == 1
+        assert deferred[0].payload == {
+            "review_task_id": rereview,
+            "verdict": "CLEAN",
+            "pr_url": pr_url,
+            "reviewed_sha": reviewed_sha,
+            "reason": "missing_or_mismatched_review_evidence",
+        }
+
+
+def test_clean_review_records_producer_handoff_for_downstream_child(kanban_home):
+    """Auto-closing a CLEAN-reviewed producer must preserve its handoff."""
+    pr_url = "https://github.com/acme/widgets/pull/43"
+    reviewed_sha = "e" * 40
+
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+        child = kb.create_task(conn, title="deploy after producer", assignee="deployer")
+        kb.link_tasks(conn, producer, child)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            summary="Verdict: CLEAN",
+            metadata={
+                "verdict": "CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": reviewed_sha,
+            },
+        )
+
+        assert kb.get_task(conn, producer).status == "done"
+        assert kb.get_task(conn, child).status == "ready"
+
+        runs = [run for run in kb.list_runs(conn, producer) if run.outcome == "completed"]
+        assert len(runs) == 1
+        run = runs[0]
+        assert run.summary == f"Exact-SHA review CLEAN at {reviewed_sha}"
+        assert run.metadata == {
+            "review_task_id": reviewer,
+            "pr_url": pr_url,
+            "reviewed_sha": reviewed_sha,
+            "verdict": "CLEAN",
+        }
+
+        events = kb.list_events(conn, producer)
+        routed_events = [
+            event for event in events if event.kind in {"review_approved", "completed"}
+        ]
+        assert [event.kind for event in routed_events] == ["review_approved", "completed"]
+        assert {event.run_id for event in routed_events} == {run.id}
+
+        context = kb.build_worker_context(conn, child)
+        assert "(no result recorded)" not in context
+        assert f"Exact-SHA review CLEAN at {reviewed_sha}" in context
+        assert pr_url in context
+        assert reviewed_sha in context
+
+
+def test_not_clean_review_keeps_unrelated_profile_capacity_available(
+    kanban_home, all_assignees_spawnable
+):
+    """Routing a PR producer to remediation must not consume other profiles' slots."""
+    pr_url = "https://github.com/acme/widgets/pull/7"
+    reviewed_sha = "c" * 40
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append((task.id, task.assignee))
+        return 1234
+
+    with kb.connect() as conn:
+        producer = kb.create_task(
+            conn, title="producer", assignee="author", priority=100
+        )
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+        unrelated = kb.create_task(
+            conn, title="unrelated", assignee="other-profile", priority=10
+        )
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            metadata={
+                "verdict": "NOT CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": reviewed_sha,
+                "findings": [],
+            },
+        )
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
+
+        remediation_id = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ?",
+            (f"review-remediation:{producer}:{reviewed_sha}",),
+        ).fetchone()["id"]
+        assert kb.get_task(conn, producer).status == "todo"
+        assert (producer, "active_pr") not in result.respawn_guarded
+        assert (remediation_id, "author") in spawned
+        assert (unrelated, "other-profile") in spawned
+
+
+def test_not_clean_review_without_exact_sha_fails_safe_in_todo(kanban_home):
+    """Incomplete review metadata must not promote a PR producer into active_pr."""
+    pr_url = "https://github.com/acme/widgets/pull/9"
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            metadata={"verdict": "NOT CLEAN", "pr_url": pr_url},
+        )
+
+        assert kb.get_task(conn, producer).status == "todo"
+        events = kb.list_events(conn, reviewer)
+        deferred = [event for event in events if event.kind == "review_routing_deferred"]
+        assert len(deferred) == 1
+        assert deferred[0].payload["verdict"] == "NOT CLEAN"
+
+
+def test_deferred_review_routing_stays_gated_after_dispatch_recompute(
+    kanban_home, all_assignees_spawnable
+):
+    """Deferred review routing must survive later dispatcher recompute ticks."""
+    pr_url = "https://github.com/acme/widgets/pull/9"
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append(task.id)
+        return 1234
+
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            metadata={"verdict": "NOT CLEAN", "pr_url": pr_url},
+        )
+        assert kb.get_task(conn, producer).status == "todo"
+
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+        assert result.promoted == 0
+        assert kb.get_task(conn, producer).status == "todo"
+        assert producer not in spawned
+        assert (producer, "active_pr") not in result.respawn_guarded
+
+
+def test_deferred_review_routing_stays_gated_after_reviewer_archive(
+    kanban_home, all_assignees_spawnable
+):
+    """Archiving a deferred reviewer must not reactivate its PR producer."""
+    pr_url = "https://github.com/acme/widgets/pull/11"
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append(task.id)
+        return 1234
+
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            metadata={"verdict": "NOT CLEAN", "pr_url": pr_url},
+        )
+        assert kb.get_task(conn, producer).status == "todo"
+        assert any(
+            event.kind == "review_routing_deferred"
+            for event in kb.list_events(conn, reviewer)
+        )
+
+        assert kb.archive_task(conn, reviewer)
+        assert kb.get_task(conn, reviewer).status == "archived"
+        assert kb.get_task(conn, producer).status == "todo"
+
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+        assert result.promoted == 0
+        assert kb.get_task(conn, producer).status == "todo"
+        assert producer not in spawned
+        assert (producer, "active_pr") not in result.respawn_guarded
+
+
+def test_not_clean_review_without_parseable_verdict_fails_safe_in_todo(kanban_home):
+    """Unstructured review evidence must not promote a PR producer into active_pr."""
+    pr_url = "https://github.com/acme/widgets/pull/10"
+    reviewed_sha = "d" * 40
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            summary="Verdict: NOT CLEAN",
+            metadata={"pr_url": pr_url, "reviewed_sha": reviewed_sha},
+        )
+
+        assert kb.get_task(conn, producer).status == "todo"
+        events = kb.list_events(conn, reviewer)
+        deferred = [event for event in events if event.kind == "review_routing_deferred"]
+        assert len(deferred) == 1
+        assert deferred[0].payload["verdict"] is None
+        assert deferred[0].payload["reason"] == "missing_or_unparseable_verdict"
+
+
 def test_claim_review_task_transitions_to_running(kanban_home):
     """claim_review_task atomically transitions review -> running."""
     with kb.connect() as conn:
@@ -4766,3 +5902,72 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+# ---------------------------------------------------------------------------
+# Skill validation at card-authoring time: unknown skills are stripped
+# against the assignee's installed roster so a bad skill list can't
+# spawn-kill a worker at argparse (37 deterministic worker deaths on the
+# 2026-07-11 board traced to this).
+# ---------------------------------------------------------------------------
+
+
+def _install_skill(home, profile, category, name):
+    d = home / "profiles" / profile / "skills" / category / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
+
+
+def test_create_task_strips_unknown_skills_for_assignee(kanban_home):
+    import json
+
+    kb._skill_roster_cache.clear()
+    _install_skill(kanban_home, "tester", "devops", "skill-a")
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="s", assignee="tester",
+            skills=["skill-a", "ghost-skill"],
+        )
+        task = kb.get_task(conn, tid)
+        assert task.skills == ["skill-a"]
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='created'",
+            (tid,),
+        ).fetchone()
+        payload = json.loads(ev["payload"])
+        assert payload["skills_stripped"] == ["ghost-skill"]
+
+
+def test_create_task_all_unknown_skills_degrades_to_no_skills(kanban_home):
+    kb._skill_roster_cache.clear()
+    _install_skill(kanban_home, "tester2", "devops", "real-skill")
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="s", assignee="tester2",
+            skills=["ghost-a", "ghost-b"],
+        )
+        # Better a worker without force-loaded skills than a worker that
+        # dies at argparse and breaker-blocks the card.
+        assert kb.get_task(conn, tid).skills in (None, [])
+
+
+def test_create_task_keeps_skills_when_roster_unknown(kanban_home):
+    kb._skill_roster_cache.clear()
+    with kb.connect() as conn:
+        # Assignee has no profile dir at all — validation must not guess.
+        tid = kb.create_task(
+            conn, title="s", assignee="no-such-profile",
+            skills=["anything"],
+        )
+        assert kb.get_task(conn, tid).skills == ["anything"]
+
+
+def test_skill_validation_kill_switch(kanban_home, monkeypatch):
+    kb._skill_roster_cache.clear()
+    _install_skill(kanban_home, "tester3", "devops", "skill-a")
+    monkeypatch.setenv("HERMES_KANBAN_SKILL_VALIDATION", "0")
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="s", assignee="tester3",
+            skills=["ghost-skill"],
+        )
+        assert kb.get_task(conn, tid).skills == ["ghost-skill"]
+
