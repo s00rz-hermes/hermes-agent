@@ -2098,6 +2098,32 @@ def test_dispatch_respawn_guard_emits_event_for_skipped_task(
     assert guarded_evt.payload.get("reason") == "recent_success"
 
 
+def test_dispatch_respawn_guard_coalesces_repeated_events(
+    kanban_home, all_assignees_spawnable
+):
+    """A persistent guard remains observable without an event every tick."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="guarded PR", assignee="alice")
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "Opened https://github.com/acme/widgets/pull/42",
+        )
+
+        first = kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        second = kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        guarded_events = [
+            event
+            for event in kb.list_events(conn, t)
+            if event.kind == "respawn_guarded"
+        ]
+
+    assert (t, "active_pr") in first.respawn_guarded
+    assert (t, "active_pr") in second.respawn_guarded
+    assert len(guarded_events) == 1
+
+
 # ---------------------------------------------------------------------------
 # Workspace resolution
 # ---------------------------------------------------------------------------
@@ -3693,6 +3719,501 @@ def test_dispatch_max_in_progress_none_is_unlimited(kanban_home, all_assignees_s
 def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> None:
     """Test helper: set a task's status directly."""
     conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+
+
+def test_not_clean_review_routes_same_pr_remediation_and_exact_sha_rereview(
+    kanban_home,
+):
+    """A NOT CLEAN parent review must never re-spawn its PR-bearing producer."""
+    pr_url = "https://github.com/acme/widgets/pull/42"
+    reviewed_sha = "a" * 40
+    replacement_sha = "b" * 40
+
+    with kb.connect() as conn:
+        producer = kb.create_task(
+            conn,
+            title="Implement widget telemetry",
+            body="Preserve low-cardinality telemetry and legal recovery transitions.",
+            assignee="author",
+            tenant="acme",
+            priority=50,
+        )
+        kb.add_comment(
+            conn,
+            producer,
+            "author",
+            f"Draft PR {pr_url}; branch feature/widget-telemetry; head {reviewed_sha}",
+        )
+        reviewer = kb.create_task(
+            conn,
+            title="Exact-SHA review of widget telemetry",
+            assignee="reviewer",
+            tenant="acme",
+        )
+        kb.link_tasks(conn, reviewer, producer)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            summary="Verdict: NOT CLEAN",
+            metadata={
+                "verdict": "NOT CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": reviewed_sha,
+                "findings": [
+                    {
+                        "severity": "high",
+                        "file": "widget.py",
+                        "line": 17,
+                        "issue": "retry path can duplicate events",
+                    }
+                ],
+            },
+        )
+
+        # A duplicate completion delivery is harmless and cannot fan out a
+        # second remediation/re-review pair.
+        assert not kb.complete_task(
+            conn,
+            reviewer,
+            summary="Verdict: NOT CLEAN",
+            metadata={
+                "verdict": "NOT CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": reviewed_sha,
+            },
+        )
+
+        remediation = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key = ?",
+            (f"review-remediation:{producer}:{reviewed_sha}",),
+        ).fetchall()
+        rereviews = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key = ?",
+            (f"review-rereview:{producer}:{reviewed_sha}",),
+        ).fetchall()
+
+        assert len(remediation) == 1
+        assert len(rereviews) == 1
+        remediation = remediation[0]
+        rereview = rereviews[0]
+        assert remediation["assignee"] == "author"
+        assert remediation["status"] == "ready"
+        assert rereview["assignee"] == "reviewer"
+        assert rereview["status"] == "todo"
+        assert pr_url in remediation["body"]
+        assert reviewed_sha in remediation["body"]
+        assert "same branch" in remediation["body"].lower()
+        assert "do not open" in remediation["body"].lower()
+        assert "Original producer requirements" in remediation["body"]
+        assert "Preserve low-cardinality telemetry" in remediation["body"]
+        assert pr_url in rereview["body"]
+        assert "replacement_sha" in rereview["body"]
+
+        remediation_parents = {
+            row["parent_id"]
+            for row in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?",
+                (remediation["id"],),
+            )
+        }
+        rereview_parents = {
+            row["parent_id"]
+            for row in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?",
+                (rereview["id"],),
+            )
+        }
+        producer_parents = {
+            row["parent_id"]
+            for row in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?",
+                (producer,),
+            )
+        }
+        assert remediation_parents == {reviewer}
+        assert rereview_parents == {remediation["id"]}
+        assert producer_parents == {reviewer, rereview["id"]}
+        assert kb.get_task(conn, producer).status == "todo"
+
+        assert kb.complete_task(
+            conn,
+            remediation["id"],
+            summary=f"Remediated same PR at {replacement_sha}",
+            metadata={
+                "pr_url": pr_url,
+                "replacement_sha": replacement_sha,
+                "branch": "feature/widget-telemetry",
+            },
+        )
+        assert kb.get_task(conn, rereview["id"]).status == "ready"
+        assert kb.get_task(conn, producer).status == "todo"
+
+        assert kb.complete_task(
+            conn,
+            rereview["id"],
+            summary="Verdict: CLEAN",
+            metadata={
+                "verdict": "CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": replacement_sha,
+                "reviewer_identity": "reviewer",
+            },
+        )
+        assert kb.get_task(conn, producer).status == "done"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE ?",
+            (f"review-%:{producer}:%",),
+        ).fetchone()[0] == 2
+
+
+def test_rereview_mismatched_replacement_sha_fails_closed(kanban_home):
+    """A re-review cannot close its producer at an unrelated full SHA."""
+    pr_url = "https://github.com/acme/widgets/pull/44"
+    reviewed_sha = "a" * 40
+    replacement_sha = "b" * 40
+    mismatched_sha = "c" * 40
+
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            metadata={
+                "verdict": "NOT CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": reviewed_sha,
+                "findings": [],
+            },
+        )
+        remediation = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key = ?",
+            (f"review-remediation:{producer}:{reviewed_sha}",),
+        ).fetchone()
+        rereview = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key = ?",
+            (f"review-rereview:{producer}:{reviewed_sha}",),
+        ).fetchone()
+        assert remediation is not None
+        assert rereview is not None
+
+        assert kb.complete_task(
+            conn,
+            remediation["id"],
+            metadata={"pr_url": pr_url, "replacement_sha": replacement_sha},
+        )
+        assert kb.complete_task(
+            conn,
+            rereview["id"],
+            metadata={
+                "verdict": "CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": mismatched_sha,
+            },
+        )
+
+        assert kb.get_task(conn, producer).status == "todo"
+        assert not any(
+            event.kind == "review_approved"
+            for event in kb.list_events(conn, producer)
+        )
+        deferred = [
+            event
+            for event in kb.list_events(conn, rereview["id"])
+            if event.kind == "review_routing_deferred"
+        ]
+        assert len(deferred) == 1
+        assert deferred[0].payload == {
+            "review_task_id": rereview["id"],
+            "verdict": "CLEAN",
+            "pr_url": pr_url,
+            "reviewed_sha": mismatched_sha,
+            "reason": "missing_or_mismatched_review_evidence",
+        }
+
+
+def test_rereview_unfinished_remediation_parent_fails_closed_on_manual_completion(
+    kanban_home,
+):
+    """An unfinished router remediation parent cannot be bypassed manually."""
+    pr_url = "https://github.com/acme/widgets/pull/45"
+    reviewed_sha = "d" * 40
+
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        remediation = kb.create_task(
+            conn,
+            title="Remediate producer after NOT CLEAN review",
+            body=(
+                f"Work on the same PR {pr_url}; complete with a full "
+                "40-character replacement_sha."
+            ),
+            assignee="author",
+            created_by="kanban-review-router",
+        )
+        rereview = kb.create_task(
+            conn,
+            title="Re-review producer after remediation",
+            body=(
+                f"Independently re-review the same PR {pr_url}. Require the "
+                f"remediation parent {remediation} handoff and its replacement_sha."
+            ),
+            assignee="reviewer",
+            created_by="kanban-review-router",
+        )
+        kb.link_tasks(conn, remediation, rereview)
+        kb.link_tasks(conn, rereview, producer)
+        _set_task_status(conn, rereview, "blocked")
+
+        assert kb.complete_task(
+            conn,
+            rereview,
+            metadata={
+                "verdict": "CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": reviewed_sha,
+            },
+        )
+
+        assert kb.get_task(conn, producer).status == "todo"
+        assert not any(
+            event.kind == "review_approved"
+            for event in kb.list_events(conn, producer)
+        )
+        deferred = [
+            event
+            for event in kb.list_events(conn, rereview)
+            if event.kind == "review_routing_deferred"
+        ]
+        assert len(deferred) == 1
+        assert deferred[0].payload == {
+            "review_task_id": rereview,
+            "verdict": "CLEAN",
+            "pr_url": pr_url,
+            "reviewed_sha": reviewed_sha,
+            "reason": "missing_or_mismatched_review_evidence",
+        }
+
+
+def test_clean_review_records_producer_handoff_for_downstream_child(kanban_home):
+    """Auto-closing a CLEAN-reviewed producer must preserve its handoff."""
+    pr_url = "https://github.com/acme/widgets/pull/43"
+    reviewed_sha = "e" * 40
+
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+        child = kb.create_task(conn, title="deploy after producer", assignee="deployer")
+        kb.link_tasks(conn, producer, child)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            summary="Verdict: CLEAN",
+            metadata={
+                "verdict": "CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": reviewed_sha,
+            },
+        )
+
+        assert kb.get_task(conn, producer).status == "done"
+        assert kb.get_task(conn, child).status == "ready"
+
+        runs = [run for run in kb.list_runs(conn, producer) if run.outcome == "completed"]
+        assert len(runs) == 1
+        run = runs[0]
+        assert run.summary == f"Exact-SHA review CLEAN at {reviewed_sha}"
+        assert run.metadata == {
+            "review_task_id": reviewer,
+            "pr_url": pr_url,
+            "reviewed_sha": reviewed_sha,
+            "verdict": "CLEAN",
+        }
+
+        events = kb.list_events(conn, producer)
+        routed_events = [
+            event for event in events if event.kind in {"review_approved", "completed"}
+        ]
+        assert [event.kind for event in routed_events] == ["review_approved", "completed"]
+        assert {event.run_id for event in routed_events} == {run.id}
+
+        context = kb.build_worker_context(conn, child)
+        assert "(no result recorded)" not in context
+        assert f"Exact-SHA review CLEAN at {reviewed_sha}" in context
+        assert pr_url in context
+        assert reviewed_sha in context
+
+
+def test_not_clean_review_keeps_unrelated_profile_capacity_available(
+    kanban_home, all_assignees_spawnable
+):
+    """Routing a PR producer to remediation must not consume other profiles' slots."""
+    pr_url = "https://github.com/acme/widgets/pull/7"
+    reviewed_sha = "c" * 40
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append((task.id, task.assignee))
+        return 1234
+
+    with kb.connect() as conn:
+        producer = kb.create_task(
+            conn, title="producer", assignee="author", priority=100
+        )
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+        unrelated = kb.create_task(
+            conn, title="unrelated", assignee="other-profile", priority=10
+        )
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            metadata={
+                "verdict": "NOT CLEAN",
+                "pr_url": pr_url,
+                "reviewed_sha": reviewed_sha,
+                "findings": [],
+            },
+        )
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
+
+        remediation_id = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ?",
+            (f"review-remediation:{producer}:{reviewed_sha}",),
+        ).fetchone()["id"]
+        assert kb.get_task(conn, producer).status == "todo"
+        assert (producer, "active_pr") not in result.respawn_guarded
+        assert (remediation_id, "author") in spawned
+        assert (unrelated, "other-profile") in spawned
+
+
+def test_not_clean_review_without_exact_sha_fails_safe_in_todo(kanban_home):
+    """Incomplete review metadata must not promote a PR producer into active_pr."""
+    pr_url = "https://github.com/acme/widgets/pull/9"
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            metadata={"verdict": "NOT CLEAN", "pr_url": pr_url},
+        )
+
+        assert kb.get_task(conn, producer).status == "todo"
+        events = kb.list_events(conn, reviewer)
+        deferred = [event for event in events if event.kind == "review_routing_deferred"]
+        assert len(deferred) == 1
+        assert deferred[0].payload["verdict"] == "NOT CLEAN"
+
+
+def test_deferred_review_routing_stays_gated_after_dispatch_recompute(
+    kanban_home, all_assignees_spawnable
+):
+    """Deferred review routing must survive later dispatcher recompute ticks."""
+    pr_url = "https://github.com/acme/widgets/pull/9"
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append(task.id)
+        return 1234
+
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            metadata={"verdict": "NOT CLEAN", "pr_url": pr_url},
+        )
+        assert kb.get_task(conn, producer).status == "todo"
+
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+        assert result.promoted == 0
+        assert kb.get_task(conn, producer).status == "todo"
+        assert producer not in spawned
+        assert (producer, "active_pr") not in result.respawn_guarded
+
+
+def test_deferred_review_routing_stays_gated_after_reviewer_archive(
+    kanban_home, all_assignees_spawnable
+):
+    """Archiving a deferred reviewer must not reactivate its PR producer."""
+    pr_url = "https://github.com/acme/widgets/pull/11"
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append(task.id)
+        return 1234
+
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            metadata={"verdict": "NOT CLEAN", "pr_url": pr_url},
+        )
+        assert kb.get_task(conn, producer).status == "todo"
+        assert any(
+            event.kind == "review_routing_deferred"
+            for event in kb.list_events(conn, reviewer)
+        )
+
+        assert kb.archive_task(conn, reviewer)
+        assert kb.get_task(conn, reviewer).status == "archived"
+        assert kb.get_task(conn, producer).status == "todo"
+
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+        assert result.promoted == 0
+        assert kb.get_task(conn, producer).status == "todo"
+        assert producer not in spawned
+        assert (producer, "active_pr") not in result.respawn_guarded
+
+
+def test_not_clean_review_without_parseable_verdict_fails_safe_in_todo(kanban_home):
+    """Unstructured review evidence must not promote a PR producer into active_pr."""
+    pr_url = "https://github.com/acme/widgets/pull/10"
+    reviewed_sha = "d" * 40
+    with kb.connect() as conn:
+        producer = kb.create_task(conn, title="producer", assignee="author")
+        kb.add_comment(conn, producer, "author", f"Draft PR {pr_url}")
+        reviewer = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.link_tasks(conn, reviewer, producer)
+
+        assert kb.complete_task(
+            conn,
+            reviewer,
+            summary="Verdict: NOT CLEAN",
+            metadata={"pr_url": pr_url, "reviewed_sha": reviewed_sha},
+        )
+
+        assert kb.get_task(conn, producer).status == "todo"
+        events = kb.list_events(conn, reviewer)
+        deferred = [event for event in events if event.kind == "review_routing_deferred"]
+        assert len(deferred) == 1
+        assert deferred[0].payload["verdict"] is None
+        assert deferred[0].payload["reason"] == "missing_or_unparseable_verdict"
 
 
 def test_claim_review_task_transitions_to_running(kanban_home):
