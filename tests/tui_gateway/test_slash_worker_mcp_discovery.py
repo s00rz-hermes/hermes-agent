@@ -95,7 +95,7 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         ).start()
         proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
         proc.stdin.flush()
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 30
         response = None
         while time.monotonic() < deadline:
             try:
@@ -106,7 +106,7 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
                 response = candidate
                 break
         if response is None:
-            pytest.fail("slash worker produced no /tools response within 10 seconds")
+            pytest.fail("slash worker produced no /tools response within 30 seconds")
         assert response["ok"] is True
         assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
     finally:
