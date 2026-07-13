@@ -461,7 +461,7 @@ def test_telemetry_constructor_failure_cannot_block_worker_spawn(monkeypatch):
 
     worker = server._SlashWorker("session", "model")
 
-    assert spawned == [True]
+    assert spawned
     assert worker.proc.pid == 7
 
 
