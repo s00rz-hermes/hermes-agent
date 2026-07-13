@@ -3,6 +3,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -13,6 +14,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -272,18 +274,34 @@ _stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock)
 _detached_ws_transport = _DropTransport()
 
 
+class _NullSlashTelemetry:
+    """Fail-open telemetry substitute used when instrumentation cannot initialize."""
+
+    def __getattr__(self, _name: str):
+        return lambda *_args, **_kwargs: None
+
+
 class _SlashWorker:
     """Persistent HermesCLI subprocess for slash commands."""
 
-    def __init__(self, session_key: str, model: str, profile_home: str | None = None):
+    def __init__(
+        self,
+        session_key: str,
+        model: str,
+        profile_home: str | None = None,
+        *,
+        recovery_restart: bool = False,
+    ):
         self._lock = threading.Lock()
         self._queue_lock = threading.Lock()
         self._seq = 0
         self._request_seq = 0
         self._queued_at: dict[int, float] = {}
-        self._request_results: dict[str, str] = {}
+        self._request_correlations: dict[str, tuple[str, float]] = {}
         self.stderr_tail: list[str] = []
+        self._stderr_diagnostics: deque[tuple[float, str]] = deque()
         self.stdout_queue: queue.Queue[dict | None] = queue.Queue()
+        self._queue_monitor_stop = threading.Event()
 
         argv = [
             sys.executable,
@@ -297,16 +315,25 @@ class _SlashWorker:
 
         self._closed = False
         from hermes_cli._subprocess_compat import windows_hide_flags
-        from tui_gateway.slash_telemetry import SlashTelemetry
 
-        self.telemetry = SlashTelemetry(
-            lambda line: logger.info("%s", line),
-            session_key=session_key,
-            profile_home=os.environ.get("HERMES_HOME") or str(_hermes_home),
-            parent_pid=os.getpid(),
-            launcher=sys.executable,
-            instance_seed=f"spawn:{uuid.uuid4().hex}",
-        )
+        try:
+            from tui_gateway.slash_telemetry import SlashTelemetry
+
+            self.telemetry = SlashTelemetry(
+                lambda line: logger.info("%s", line),
+                session_key=session_key,
+                profile_home=os.environ.get("HERMES_HOME") or str(_hermes_home),
+                parent_pid=os.getpid(),
+                launcher=sys.executable,
+                instance_seed=f"spawn:{uuid.uuid4().hex}",
+            )
+        except Exception:
+            self.telemetry = _NullSlashTelemetry()
+        if recovery_restart:
+            try:
+                self.telemetry.record_restart_attempt()
+            except Exception:
+                pass
 
         # slash_worker runs the Hermes agent → needs provider credentials.
         # Tier-1 secrets (gateway/GitHub/infra) are still stripped (#29157).
@@ -349,6 +376,7 @@ class _SlashWorker:
         self.telemetry.emit("worker_starting", state="starting", reason="spawn_requested")
         threading.Thread(target=self._drain_stdout, daemon=True).start()
         threading.Thread(target=self._drain_stderr, daemon=True).start()
+        threading.Thread(target=self._monitor_queue_health, daemon=True).start()
 
     def _drain_stdout(self):
         for line in self.proc.stdout or []:
@@ -371,27 +399,80 @@ class _SlashWorker:
                     "worker_bootstrap_failed",
                     state="failed",
                     reason="initialization_failure",
+                    exit_code=message.get("exit_code"),
                 )
                 continue
             self.stdout_queue.put(message)
+        if not self._closed:
+            self.telemetry.emit(
+                "worker_crashed",
+                state="crashed",
+                reason="abrupt_exit",
+                exit_code=self.proc.poll(),
+            )
         self.stdout_queue.put(None)
 
-    def _drain_stderr(self):
+    def _retain_stderr_diagnostic(
+        self, text: str | None = None, *, now: float | None = None
+    ) -> None:
         from tui_gateway.slash_telemetry import redact_summary
 
+        observed_at = time.monotonic() if now is None else now
+        if text:
+            self._stderr_diagnostics.append((observed_at, redact_summary(text)))
+        cutoff = observed_at - 300.0
+        while self._stderr_diagnostics and self._stderr_diagnostics[0][0] < cutoff:
+            self._stderr_diagnostics.popleft()
+        while len(self._stderr_diagnostics) > 80:
+            self._stderr_diagnostics.popleft()
+        self.stderr_tail = [diagnostic for _, diagnostic in self._stderr_diagnostics]
+
+    def _drain_stderr(self):
         for line in self.proc.stderr or []:
             if text := line.rstrip("\n"):
-                self.stderr_tail = (self.stderr_tail + [redact_summary(text)])[-80:]
+                self._retain_stderr_diagnostic(text)
+
+    def _observe_queue_health(self, *, now: float | None = None) -> None:
+        observed_at = time.monotonic() if now is None else now
+        with self._queue_lock:
+            depth = len(self._queued_at)
+            oldest_age = (
+                max(0.0, observed_at - min(self._queued_at.values()))
+                if self._queued_at
+                else 0.0
+            )
+        self.telemetry.observe_queue(depth=depth, oldest_age_seconds=oldest_age)
+
+    def _monitor_queue_health(self) -> None:
+        while not self._queue_monitor_stop.wait(1.0):
+            try:
+                self._observe_queue_health()
+            except Exception:
+                pass
 
     def run(self, command: str, *, request_ref: object = None) -> str:
         external_ref = str(request_ref) if request_ref is not None else ""
         if external_ref:
+            now = time.monotonic()
+            ref_hash = hashlib.sha256(external_ref.encode("utf-8", errors="ignore")).hexdigest()[:16]
+            command_hash = hashlib.sha256(command.encode("utf-8", errors="ignore")).hexdigest()[:16]
             with self._queue_lock:
-                cached = self._request_results.get(external_ref)
-                cached_exists = external_ref in self._request_results
-            if cached_exists:
-                self.telemetry.record_duplicate(command=command, command_ref=external_ref)
-                return cached or ""
+                cutoff = now - 300.0
+                self._request_correlations = {
+                    key: value
+                    for key, value in self._request_correlations.items()
+                    if value[1] >= cutoff
+                }
+                previous = self._request_correlations.get(ref_hash)
+                if len(self._request_correlations) >= 128 and ref_hash not in self._request_correlations:
+                    self._request_correlations.pop(next(iter(self._request_correlations)))
+                self._request_correlations[ref_hash] = (command_hash, now)
+            if previous is not None:
+                self.telemetry.record_correlation_reuse(
+                    command=command,
+                    command_ref=ref_hash,
+                    command_changed=previous[0] != command_hash,
+                )
         if self.proc.poll() is not None:
             self.telemetry.emit(
                 "worker_crashed",
@@ -420,15 +501,18 @@ class _SlashWorker:
             queue_depth_bucket=depth_bucket(queue_depth),
             queue_age_bucket=age_bucket(oldest_age),
         )
-        self.telemetry.observe_queue(
-            depth=queue_depth, oldest_age_seconds=oldest_age
-        )
+        self._observe_queue_health(now=queued_at)
 
         with self._lock:
             started_at = time.monotonic()
             with self._queue_lock:
                 self._queued_at.pop(request_id, None)
                 queue_depth = len(self._queued_at)
+                oldest_age = (
+                    max(0.0, started_at - min(self._queued_at.values()))
+                    if self._queued_at
+                    else 0.0
+                )
             self.telemetry.emit(
                 "command_dispatched",
                 state="dispatched",
@@ -436,10 +520,10 @@ class _SlashWorker:
                 command=command,
                 command_ref=request_ref,
                 queue_depth_bucket=depth_bucket(queue_depth),
-                queue_age_bucket=age_bucket(started_at - queued_at),
+                queue_age_bucket=age_bucket(oldest_age),
             )
             self.telemetry.observe_queue(
-                depth=queue_depth, oldest_age_seconds=started_at - queued_at
+                depth=queue_depth, oldest_age_seconds=oldest_age
             )
             self.telemetry.emit(
                 "command_started",
@@ -450,8 +534,20 @@ class _SlashWorker:
             )
             self._seq += 1
             rid = self._seq
-            self.proc.stdin.write(json.dumps({"id": rid, "command": command}) + "\n")
-            self.proc.stdin.flush()
+            try:
+                self.proc.stdin.write(json.dumps({"id": rid, "command": command}) + "\n")
+                self.proc.stdin.flush()
+            except Exception as exc:
+                self.telemetry.emit(
+                    "command_failed",
+                    state="failed",
+                    reason="pipe_closed",
+                    command=command,
+                    command_ref=request_ref,
+                    latency_bucket=latency_bucket(time.monotonic() - started_at),
+                    summary=type(exc).__name__,
+                )
+                raise
 
             while True:
                 try:
@@ -490,13 +586,7 @@ class _SlashWorker:
                     queue_depth_bucket=depth_bucket(queue_depth),
                     latency_bucket=latency_bucket(time.monotonic() - started_at),
                 )
-                result = str(msg.get("output", "")).rstrip()
-                if external_ref:
-                    with self._queue_lock:
-                        if len(self._request_results) >= 128:
-                            self._request_results.pop(next(iter(self._request_results)))
-                        self._request_results[external_ref] = result
-                return result
+                return str(msg.get("output", "")).rstrip()
 
             self.telemetry.emit(
                 "command_abandoned",
@@ -507,6 +597,7 @@ class _SlashWorker:
                 latency_bucket=latency_bucket(time.monotonic() - started_at),
                 summary="worker protocol pipe closed",
             )
+            self._retain_stderr_diagnostic()
             raise RuntimeError(
                 f"slash worker closed pipe{': ' + chr(10).join(self.stderr_tail[-8:]) if self.stderr_tail else ''}"
             )
@@ -515,52 +606,59 @@ class _SlashWorker:
         if getattr(self, "_closed", False):
             return
         self._closed = True
+        monitor_stop = getattr(self, "_queue_monitor_stop", None)
+        if monitor_stop is not None:
+            monitor_stop.set()
         proc = self.proc
         forced = False
+        shutdown_error: Exception | None = None
         telemetry = getattr(self, "telemetry", None)
         if telemetry is not None:
             telemetry.emit(
                 "worker_stopping", state="stopping", reason="graceful_shutdown"
             )
-        try:
-            if proc.poll() is None:
+        if proc.poll() is None:
+            try:
                 proc.terminate()
+            except Exception as exc:
+                shutdown_error = exc
+            if proc.poll() is None:
                 try:
                     proc.wait(timeout=1)
-                except Exception:
+                except Exception as exc:
+                    shutdown_error = exc
                     forced = True
-                    proc.kill()
                     try:
-                        proc.wait(timeout=1)  # reap the zombie SIGKILL leaves behind
-                    except Exception:
-                        pass
-        except Exception:
-            forced = True
+                        proc.kill()
+                    except Exception as kill_exc:
+                        shutdown_error = kill_exc
+                    if proc.poll() is None:
+                        try:
+                            proc.wait(timeout=1)
+                        except Exception as wait_exc:
+                            shutdown_error = wait_exc
+        exit_code = proc.poll()
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
             try:
-                proc.kill()
-                proc.wait(timeout=1)
-            except Exception as exc:
-                if telemetry is not None:
-                    telemetry.emit(
-                        "worker_shutdown_failed",
-                        state="failed",
-                        reason="shutdown_failed",
-                        summary=f"{type(exc).__name__}: {exc}",
-                    )
-        finally:
-            for stream in (proc.stdin, proc.stdout, proc.stderr):
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-            if telemetry is not None:
+                stream.close()
+            except Exception:
+                pass
+        if telemetry is not None:
+            if exit_code is None:
+                telemetry.emit(
+                    "worker_shutdown_failed",
+                    state="failed",
+                    reason="shutdown_failed",
+                    summary=type(shutdown_error).__name__ if shutdown_error else "process_live",
+                )
+            else:
                 telemetry.emit(
                     "worker_stopped",
                     state="stopped",
                     reason="forced_shutdown" if forced else "graceful_shutdown",
-                    exit_code=proc.poll(),
+                    exit_code=exit_code,
                 )
-                telemetry.flush_suppressed()
+            telemetry.flush_suppressed()
 
 
 def _load_busy_input_mode() -> str:
@@ -2946,9 +3044,6 @@ def _restart_slash_worker(sid: str, session: dict):
             getattr(session.get("agent"), "model", _resolve_model()),
             profile_home=session.get("profile_home"),
         )
-        telemetry = getattr(new_worker, "telemetry", None)
-        if telemetry is not None:
-            telemetry.record_restart_attempt()
     except Exception:
         session["slash_worker"] = None
         return
@@ -13229,6 +13324,24 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     return ""
 
 
+def _slash_worker_telemetry(session: dict):
+    worker = session.get("slash_worker")
+    return getattr(worker, "telemetry", None) if worker is not None else None
+
+
+def _record_slash_rejection(session: dict, command: str, request_ref: object) -> None:
+    try:
+        telemetry = _slash_worker_telemetry(session)
+        if telemetry is not None:
+            telemetry.record_command_rejected(
+                command=command,
+                command_ref=request_ref,
+                reason="invalid_request",
+            )
+    except Exception:
+        pass
+
+
 @method("slash.exec")
 def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
@@ -13237,6 +13350,7 @@ def _(rid, params: dict) -> dict:
 
     cmd = params.get("command", "").strip()
     if not cmd:
+        _record_slash_rejection(session, cmd, rid)
         return _err(rid, 4004, "empty command")
 
     # Skill slash commands and _pending_input commands must NOT go through the
@@ -13264,6 +13378,7 @@ def _(rid, params: dict) -> dict:
     if _cmd_base in _WORKER_BLOCKED_COMMANDS:
         subcommand = _cmd_arg.split(maxsplit=1)[0].lower() if _cmd_arg else ""
         if subcommand in {"restore", "rewind"}:
+            _record_slash_rejection(session, cmd, rid)
             return _err(
                 rid,
                 4018,
@@ -13275,6 +13390,7 @@ def _(rid, params: dict) -> dict:
 
         _cmd_key = f"/{_cmd_base}"
         if _cmd_key in get_skill_commands():
+            _record_slash_rejection(session, cmd, rid)
             return _err(
                 rid, 4018, f"skill command: use command.dispatch for {_cmd_key}"
             )
@@ -13309,8 +13425,10 @@ def _(rid, params: dict) -> dict:
                 session["session_key"],
                 getattr(session.get("agent"), "model", _resolve_model()),
                 profile_home=session.get("profile_home"),
+                recovery_restart=bool(session.get("slash_worker_recovery_pending")),
             )
             _attach_worker(params.get("session_id", ""), session, worker)
+            session.pop("slash_worker_recovery_pending", None)
         except Exception as e:
             return _err(rid, 5030, f"slash worker start failed: {e}")
 
@@ -13320,6 +13438,15 @@ def _(rid, params: dict) -> dict:
             if isinstance(worker, _SlashWorker)
             else worker.run(cmd)
         )
+    except Exception as e:
+        try:
+            worker.close()
+        except Exception:
+            pass
+        session["slash_worker"] = None
+        session["slash_worker_recovery_pending"] = True
+        return _err(rid, 5030, str(e))
+    try:
         warning = _mirror_slash_side_effects(params.get("session_id", ""), session, cmd)
         payload = {"output": output or "(no output)"}
         if warning:
@@ -13327,10 +13454,15 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, payload)
     except Exception as e:
         try:
-            worker.close()
+            telemetry = _slash_worker_telemetry(session)
+            if telemetry is not None:
+                telemetry.record_delivery_handoff_failure(
+                    command=cmd,
+                    command_ref=rid,
+                    gateway_event_ref="slash.exec",
+                )
         except Exception:
             pass
-        session["slash_worker"] = None
         return _err(rid, 5030, str(e))
 
 

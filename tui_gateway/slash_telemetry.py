@@ -185,7 +185,7 @@ class SlashTelemetry:
         self._cardinality_limit = max(1, int(cardinality_limit))
         self._dedup: dict[str, float] = {}
         self._burst: deque[float] = deque()
-        self._cardinality: set[str] = set()
+        self._cardinality: dict[str, float] = {}
         self._suppressed_count = 0
         self._dropped_count = 0
         self._cardinality_dropped_count = 0
@@ -241,6 +241,11 @@ class SlashTelemetry:
         if not _bypass_limits:
             while self._burst and now - self._burst[0] >= 60.0:
                 self._burst.popleft()
+            cutoff = now - self._dedup_window
+            self._dedup = {key: ts for key, ts in self._dedup.items() if ts >= cutoff}
+            self._cardinality = {
+                key: ts for key, ts in self._cardinality.items() if ts >= cutoff
+            }
             if dedup_key is not None:
                 dedup_ref = _opaque("dedup", dedup_key)
                 previous = self._dedup.get(dedup_ref)
@@ -248,9 +253,8 @@ class SlashTelemetry:
                     self._suppressed_count += 1
                     return None
                 self._dedup[dedup_ref] = now
-                if len(self._dedup) > self._cardinality_limit * 4:
-                    cutoff = now - self._dedup_window
-                    self._dedup = {key: ts for key, ts in self._dedup.items() if ts >= cutoff}
+                while len(self._dedup) > self._cardinality_limit * 4:
+                    self._dedup.pop(next(iter(self._dedup)))
             if len(self._burst) >= self._burst_limit:
                 self._dropped_count += 1
                 return None
@@ -263,7 +267,7 @@ class SlashTelemetry:
                     fields[key] = "overflow"
                     self._cardinality_dropped_count += 1
                 else:
-                    self._cardinality.add(candidate)
+                    self._cardinality[candidate] = now
 
         event_name = re.sub(r"[^a-z0-9_.-]", "_", str(event).lower())[:64]
         safe_state = state if state in _ALLOWED_STATES else "failed"
@@ -274,8 +278,9 @@ class SlashTelemetry:
             severity = "warning"
         else:
             severity = "info"
+        fingerprint_group = str(fields.pop("_fingerprint_group", event_name))[:64]
         fingerprint_seed = ":".join(
-            (event_name, safe_state, safe_reason, self._refs["session_ref"])
+            (fingerprint_group, self._refs["session_ref"])
         )
         fingerprint = hashlib.sha256(fingerprint_seed.encode("ascii")).hexdigest()[:16]
         record: dict[str, Any] = {
@@ -328,15 +333,26 @@ class SlashTelemetry:
         """Record a bounded restart window and emit one loop transition edge."""
         now = self._clock()
         session_ref = self._refs["session_ref"]
+        window = max(1.0, window_seconds)
         with self._restart_lock:
+            expired = [
+                key
+                for key, values in self._restart_windows.items()
+                if not values or now - values[-1] > window
+            ]
+            for key in expired:
+                self._restart_windows.pop(key, None)
+                self._restart_loops.discard(key)
+            while len(self._restart_windows) >= 128 and session_ref not in self._restart_windows:
+                oldest = next(iter(self._restart_windows))
+                self._restart_windows.pop(oldest, None)
+                self._restart_loops.discard(oldest)
             history = self._restart_windows.setdefault(session_ref, deque())
-            while history and now - history[0] > max(1.0, window_seconds):
+            while history and now - history[0] > window:
                 history.popleft()
             history.append(now)
             count = len(history)
             loop_edge = count >= max(2, threshold) and session_ref not in self._restart_loops
-            if loop_edge:
-                self._restart_loops.add(session_ref)
         emitted: list[dict[str, Any]] = []
         attempt = self.emit(
             "worker_restart_attempt",
@@ -352,8 +368,11 @@ class SlashTelemetry:
                 state="degraded",
                 reason="restart_loop",
                 restart_count=count,
+                _fingerprint_group="worker_restart_health",
             )
             if loop:
+                with self._restart_lock:
+                    self._restart_loops.add(session_ref)
                 emitted.append(loop)
         return emitted
 
@@ -363,13 +382,17 @@ class SlashTelemetry:
         with self._restart_lock:
             if session_ref not in self._restart_loops:
                 return None
-            self._restart_loops.remove(session_ref)
-            self._restart_windows.pop(session_ref, None)
-        return self.emit(
+        emitted = self.emit(
             "worker_restart_recovered",
             state="recovered",
             reason="restart_recovered",
+            _fingerprint_group="worker_restart_health",
         )
+        if emitted is not None:
+            with self._restart_lock:
+                self._restart_loops.discard(session_ref)
+                self._restart_windows.pop(session_ref, None)
+        return emitted
 
     def observe_queue(self, *, depth: Any, oldest_age_seconds: Any) -> dict[str, Any] | None:
         """Emit only queue pressure and healthy recovery transitions."""
@@ -391,32 +414,38 @@ class SlashTelemetry:
         if next_health == self._queue_health:
             return None
         previous_health = self._queue_health
-        self._queue_health = next_health
         if next_health == "stalled":
-            return self.emit(
+            emitted = self.emit(
                 "queue_stalled",
                 state="stalled",
                 reason="queue_stall",
                 queue_depth_bucket=depth_bucket(depth_value),
                 queue_age_bucket=age_bucket(age_value),
+                _fingerprint_group="queue_health",
             )
-        if next_health == "degraded":
-            return self.emit(
+        elif next_health == "degraded":
+            emitted = self.emit(
                 "queue_degraded",
                 state="degraded",
                 reason="queue_pressure",
                 queue_depth_bucket=depth_bucket(depth_value),
                 queue_age_bucket=age_bucket(age_value),
+                _fingerprint_group="queue_health",
             )
-        if previous_health != "healthy":
-            return self.emit(
+        elif previous_health != "healthy":
+            emitted = self.emit(
                 "queue_recovered",
                 state="recovered",
                 reason="queue_recovered",
                 queue_depth_bucket=depth_bucket(depth_value),
                 queue_age_bucket=age_bucket(age_value),
+                _fingerprint_group="queue_health",
             )
-        return None
+        else:
+            emitted = None
+        if emitted is not None:
+            self._queue_health = next_health
+        return emitted
 
     def record_command_rejected(
         self, *, command: Any, command_ref: Any, reason: str = "invalid_request"
@@ -441,6 +470,20 @@ class SlashTelemetry:
             command=command,
             command_ref=command_ref,
             dedup_key=command_ref,
+        )
+
+    def record_correlation_reuse(
+        self, *, command: Any, command_ref: Any, command_changed: bool
+    ) -> dict[str, Any] | None:
+        """Record opaque JSON-RPC ID reuse without suppressing command execution."""
+        return self.emit(
+            "command_correlation_reused",
+            state="accepted",
+            reason="duplicate_request",
+            command=command,
+            command_ref=command_ref,
+            correlation_changed_bucket="changed" if command_changed else "same",
+            dedup_key=(command_ref, command_changed),
         )
 
     def record_delivery_handoff_failure(
@@ -469,13 +512,15 @@ class SlashTelemetry:
             "dropped_count": self._dropped_count,
             "cardinality_dropped_count": self._cardinality_dropped_count,
         }
-        self._suppressed_count = 0
-        self._dropped_count = 0
-        self._cardinality_dropped_count = 0
-        return self.emit(
+        emitted = self.emit(
             "telemetry_suppressed",
             state="suppressed",
             reason="telemetry_backpressure",
             _bypass_limits=True,
             **counts,
         )
+        if emitted is not None:
+            self._suppressed_count = 0
+            self._dropped_count = 0
+            self._cardinality_dropped_count = 0
+        return emitted

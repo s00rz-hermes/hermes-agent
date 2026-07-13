@@ -161,7 +161,11 @@ def main():
         # Never put raw bootstrap exceptions on this pre-logger control path.
         sys.stdout.write(
             json.dumps(
-                {"telemetry": "bootstrap_failed", "reason": "initialization_failure"}
+                {
+                    "telemetry": "bootstrap_failed",
+                    "reason": "initialization_failure",
+                    "exit_code": 1,
+                }
             )
             + "\n"
         )
