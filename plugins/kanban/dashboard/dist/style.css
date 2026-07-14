@@ -1590,3 +1590,30 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+/* In-app confirmation bar (replaces window.confirm popups) */
+.hermes-kanban-inline-confirm {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin: 0.375rem 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid hsl(var(--destructive) / 0.45);
+  border-radius: 0.5rem;
+  background: hsl(var(--destructive) / 0.08);
+  font-size: 0.8125rem;
+  line-height: 1.35;
+}
+
+.hermes-kanban-inline-confirm-msg {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+
+.hermes-kanban-inline-confirm-actions {
+  display: inline-flex;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}

@@ -151,6 +151,36 @@
     return tx(t, key, FALLBACK_DIAGNOSTIC_EVENT_LABELS[kind]);
   }
 
+  // In-app confirmation bar. Replaces browser-native window.confirm dialogs
+  // (which iOS Safari renders as disruptive popups) with deterministic
+  // app-owned Confirm/Cancel controls. Nothing mutates until Confirm is
+  // tapped; Cancel disarms without side effects.
+  function InlineConfirm(props) {
+    const { t } = useI18n();
+    const confirm = props.confirm;
+    if (!confirm || !confirm.message) return null;
+    return h("div", {
+      className: "hermes-kanban-inline-confirm",
+      role: "alertdialog",
+      "aria-live": "assertive",
+    },
+      h("span", { className: "hermes-kanban-inline-confirm-msg" }, confirm.message),
+      h("span", { className: "hermes-kanban-inline-confirm-actions" },
+        h(Button, {
+          size: "sm",
+          className: "h-7",
+          onClick: props.onConfirm,
+        }, confirm.confirmLabel || tx(t, "confirm", "Confirm")),
+        h(Button, {
+          size: "sm",
+          variant: "outline",
+          className: "h-7",
+          onClick: props.onCancel,
+        }, tx(t, "cancel", "Cancel")),
+      ),
+    );
+  }
+
   const COLUMN_DOT = {
     triage: "hermes-kanban-dot-triage",
     todo: "hermes-kanban-dot-todo",
@@ -714,10 +744,21 @@
       });
     }, [boardData, tenantFilter, assigneeFilter, search]);
 
+    // --- in-app confirmation (no browser-native popups) ---------------------
+    // Destructive actions arm pageConfirm and render an InlineConfirm bar;
+    // nothing mutates until the user taps Confirm inside the app.
+    const [pageConfirm, setPageConfirm] = useState(null);
+    const [pendingDeleteId, setPendingDeleteId] = useState(null);
+    const requestInAppConfirm = useCallback(function (opts) {
+      setPageConfirm(Object.assign({}, opts));
+    }, []);
+    const clearPageConfirm = useCallback(function () {
+      setPageConfirm(null);
+      setPendingDeleteId(null);
+    }, []);
+
     // --- actions ------------------------------------------------------------
-    const moveTask = useCallback(function (taskId, newStatus) {
-      const confirmMsg = getDestructiveConfirm(t, newStatus);
-      if (confirmMsg && !window.confirm(confirmMsg)) return;
+    const performMoveTask = useCallback(function (taskId, newStatus) {
       const patch = withCompletionSummary({ status: newStatus }, 1, t);
       if (!patch) return;
       setBoardData(function (b) {
@@ -746,14 +787,24 @@
       });
     }, [loadBoard, board, t]);
 
+    const moveTask = useCallback(function (taskId, newStatus) {
+      const confirmMsg = getDestructiveConfirm(t, newStatus);
+      if (confirmMsg) {
+        requestInAppConfirm({
+          message: confirmMsg,
+          onConfirm: function () { performMoveTask(taskId, newStatus); },
+        });
+        return;
+      }
+      performMoveTask(taskId, newStatus);
+    }, [performMoveTask, requestInAppConfirm, t]);
+
     const clearSelected = useCallback(function () {
       setSelectedIds(new Set());
       setLastSelectedId(null);
       setFailedIds(new Set());
     }, []);
-    const moveSelected = useCallback(function (newStatus) {
-      const confirmMsg = DESTRUCTIVE_TRANSITIONS[newStatus];
-      if (confirmMsg && !window.confirm(confirmMsg)) return;
+    const performMoveSelected = useCallback(function (newStatus) {
       if (selectedIds.size === 0) return;
       const patch = withCompletionSummary({ status: newStatus }, selectedIds.size);
       if (!patch) return;
@@ -795,6 +846,19 @@
         loadBoard();
       });
     }, [selectedIds, loadBoard, board]);
+
+    const moveSelected = useCallback(function (newStatus) {
+      if (selectedIds.size === 0) return;
+      const confirmMsg = getDestructiveConfirm(t, newStatus);
+      if (confirmMsg) {
+        requestInAppConfirm({
+          message: confirmMsg,
+          onConfirm: function () { performMoveSelected(newStatus); },
+        });
+        return;
+      }
+      performMoveSelected(newStatus);
+    }, [selectedIds, performMoveSelected, requestInAppConfirm, t]);
 
     const createTask = useCallback(function (body) {
       return SDK.fetchJSON(withBoard(`${API}/tasks`, board), {
@@ -889,9 +953,8 @@
       if (col.tasks && col.tasks.length > 0) setLastSelectedId(col.tasks[0].id);
     }, [filteredBoard, selectedIds]);
 
-    const applyBulk = useCallback(function (patch, confirmMsg) {
+    const performApplyBulk = useCallback(function (patch) {
       if (selectedIds.size === 0) return;
-      if (confirmMsg && !window.confirm(confirmMsg)) return;
       const finalPatch = withCompletionSummary(patch, selectedIds.size, t);
       if (!finalPatch) return;
       const body = Object.assign({ ids: Array.from(selectedIds) }, finalPatch);
@@ -939,6 +1002,18 @@
         });
     }, [selectedIds, loadBoard, board, t]);
 
+    const applyBulk = useCallback(function (patch, confirmMsg) {
+      if (selectedIds.size === 0) return;
+      if (confirmMsg) {
+        requestInAppConfirm({
+          message: confirmMsg,
+          onConfirm: function () { performApplyBulk(patch); },
+        });
+        return;
+      }
+      performApplyBulk(patch);
+    }, [selectedIds, performApplyBulk, requestInAppConfirm]);
+
     // --- board switching ----------------------------------------------------
     const switchBoard = useCallback(function (nextSlug) {
       if (!nextSlug || nextSlug === board) return;
@@ -981,8 +1056,7 @@
       });
     }, [board, loadBoardList, switchBoard]);
 
-   const deleteTask = useCallback(function (taskId) {
-     if (!window.confirm(tx(t, "trash.confirm", FALLBACK_TRASH.confirm))) return Promise.resolve();
+   const performDeleteTask = useCallback(function (taskId) {
      return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(taskId)}`, {
        method: "DELETE",
      }).then(function () {
@@ -993,19 +1067,37 @@
          return next;
        });
      }).catch(function (e) { setError(String(e.message || e)); });
-   }, [board, loadBoard, t]);
+   }, [board, loadBoard]);
 
-    const deleteSelected = useCallback(function (count) {
-      if (selectedIds.size === 0) return Promise.resolve();
-      if (!window.confirm(tx(t, "trash.confirmMany", "Permanently delete {n} selected tasks? This cannot be undone.", { n: count }))) return Promise.resolve();
-      const ids = Array.from(selectedIds);
+   const deleteTask = useCallback(function (taskId) {
+     setPendingDeleteId(taskId);
+     requestInAppConfirm({
+       message: tx(t, "trash.confirm", FALLBACK_TRASH.confirm),
+       confirmLabel: tx(t, "delete", "Delete"),
+       onConfirm: function () { performDeleteTask(taskId); },
+     });
+     return Promise.resolve();
+   }, [performDeleteTask, requestInAppConfirm, t]);
+
+    const performDeleteMany = useCallback(function (ids) {
       setSelectedIds(new Set());
       return Promise.all(ids.map(function (id) {
         return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(id)}`, { method: "DELETE" });
       })).then(function () {
         loadBoard();
       }).catch(function (e) { setError(String(e.message || e)); });
-    }, [selectedIds, board, loadBoard, t]);
+    }, [board, loadBoard]);
+
+    const deleteSelected = useCallback(function (count) {
+      if (selectedIds.size === 0) return Promise.resolve();
+      const ids = Array.from(selectedIds);
+      requestInAppConfirm({
+        message: tx(t, "trash.confirmMany", "Permanently delete {n} selected tasks? This cannot be undone.", { n: count || ids.length }),
+        confirmLabel: tx(t, "delete", "Delete"),
+        onConfirm: function () { performDeleteMany(ids); },
+      });
+      return Promise.resolve();
+    }, [selectedIds, performDeleteMany, requestInAppConfirm, t]);
 
     // --- render -------------------------------------------------------------
     if (loading && !boardData) {
@@ -1035,6 +1127,16 @@
           onSwitch: switchBoard,
           onNewClick: function () { setShowNewBoard(true); },
           onDeleteBoard: deleteBoard,
+          onRequestConfirm: requestInAppConfirm,
+        }),
+        h(InlineConfirm, {
+          confirm: pageConfirm,
+          onConfirm: function () {
+            const armed = pageConfirm;
+            clearPageConfirm();
+            if (armed && armed.onConfirm) armed.onConfirm();
+          },
+          onCancel: clearPageConfirm,
         }),
         showNewBoard ? h(NewBoardDialog, {
           onCancel: function () { setShowNewBoard(false); },
@@ -1067,7 +1169,7 @@
          onApply: applyBulk,
          onClear: clearSelected,
          onSelectAllVisible: selectAllVisible,
-         onDelete: deleteSelected,
+         onDeleteMany: deleteSelected,
        }) : null,
         error ? h("div", { className: "text-xs text-destructive px-2" }, error) : null,
         h(BoardColumns, {
@@ -1084,6 +1186,8 @@
           onMove: moveTask,
           onMoveSelected: moveSelected,
           onDelete: deleteTask,
+          onDeleteMany: deleteSelected,
+          pendingDeleteId: pendingDeleteId,
           onOpen: setSelectedTaskId,
           onCreate: createTask,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
@@ -1870,7 +1974,11 @@
               const msg = tx(t, "archiveBoardConfirm",
                 "Archive board '{name}'? It will be moved to boards/_archived/ so you can recover it later. Tasks on this board will no longer appear anywhere in the UI.",
                 { name: currentName });
-              if (window.confirm(msg)) props.onDeleteBoard(props.board);
+              props.onRequestConfirm({
+                message: msg,
+                confirmLabel: tx(t, "archive", "Archive"),
+                onConfirm: function () { props.onDeleteBoard(props.board); },
+              });
             },
             size: "sm",
             className: "h-8",
@@ -2140,7 +2248,7 @@
       }, tx(t, "archive", "Archive")),
       h(Button, {
         onClick: function () {
-          props.onDelete(props.count);
+          props.onDeleteMany(props.count);
         },
         size: "sm",
         variant: "destructive",
@@ -2240,11 +2348,9 @@
       setDragOver(false);
       const taskId = e.dataTransfer.getData(MIME_TASK);
       if (!taskId) return;
-      if (props.selectedIds && props.selectedIds.has(taskId) && props.selectedIds.size > 1) {
-        if (window.confirm(tx(t, "trash.confirmMany", "Permanently delete {n} selected tasks? This cannot be undone.", { n: props.selectedIds.size }))) {
-          const ids = Array.from(props.selectedIds);
-          Promise.all(ids.map(function (id) { return props.onDelete(id); })).catch(function () {});
-        }
+      if (props.selectedIds && props.selectedIds.has(taskId) && props.selectedIds.size > 1 && props.onDeleteMany) {
+        // Arms the app-owned inline confirmation; nothing is deleted here.
+        props.onDeleteMany(props.selectedIds.size);
       } else {
         props.onDelete(taskId);
       }
@@ -2402,6 +2508,7 @@
         draggingTaskId: props.draggingTaskId,
         selectedIds: props.selectedIds,
         onDelete: props.onDelete,
+        onDeleteMany: props.onDeleteMany,
       }),
     );
   }
@@ -3025,10 +3132,9 @@
         .catch(function (e) { setUploadErr(String(e.message || e)); });
     };
 
-    const doPatch = function (patch, opts) {
-      if (opts && opts.confirm && !window.confirm(opts.confirm)) {
-        return Promise.resolve();
-      }
+    const doPatch = function (patch) {
+      // Destructive-action confirmation is owned by StatusActions' inline
+      // pendingConfirm UI; by the time doPatch runs the user has confirmed.
       const finalPatch = withCompletionSummary(patch, 1);
       if (!finalPatch) return Promise.resolve();
       setPatchErr(null);
@@ -3225,6 +3331,8 @@
     const atts = props.attachments || [];
     const fileRef = useRef(null);
     const [dlErr, setDlErr] = useState(null);
+    // Attachment removal arms an inline confirm row (no native popup).
+    const [pendingRemoveId, setPendingRemoveId] = useState(null);
     // Download via authenticated fetch → blob → synthetic anchor click.
     // A plain <a href> can't carry the auth the dashboard middleware requires,
     // so fetch authenticated and hand the browser a blob URL instead.
@@ -3287,29 +3395,36 @@
         ? h("div", { className: "text-xs text-muted-foreground" },
             tx(i18n, "noAttachments", "— no attachments —"))
         : atts.map(function (a) {
-            return h("div", {
-              key: a.id,
-              className: "flex items-center justify-between gap-2 py-1 text-sm",
-            },
-              h("button", {
-                type: "button",
-                className: "hermes-kanban-attachment-link truncate",
-                title: a.filename,
-                onClick: function () { downloadAttachment(a); },
-              }, a.filename),
-              h("span", { className: "text-xs text-muted-foreground whitespace-nowrap" },
-                _fmtBytes(a.size)),
-              h("button", {
-                type: "button",
-                className: "hermes-kanban-drawer-close",
-                title: tx(i18n, "removeAttachment", "Remove attachment"),
-                onClick: function () {
-                  if (window.confirm(tx(i18n, "confirmRemoveAttachment",
-                      "Remove this attachment?"))) {
-                    if (props.onDelete) props.onDelete(a.id);
-                  }
+            return h("div", { key: a.id },
+              h("div", {
+                className: "flex items-center justify-between gap-2 py-1 text-sm",
+              },
+                h("button", {
+                  type: "button",
+                  className: "hermes-kanban-attachment-link truncate",
+                  title: a.filename,
+                  onClick: function () { downloadAttachment(a); },
+                }, a.filename),
+                h("span", { className: "text-xs text-muted-foreground whitespace-nowrap" },
+                  _fmtBytes(a.size)),
+                h("button", {
+                  type: "button",
+                  className: "hermes-kanban-drawer-close",
+                  title: tx(i18n, "removeAttachment", "Remove attachment"),
+                  onClick: function () { setPendingRemoveId(a.id); },
+                }, "×"),
+              ),
+              pendingRemoveId === a.id ? h(InlineConfirm, {
+                confirm: {
+                  message: tx(i18n, "confirmRemoveAttachment", "Remove this attachment?"),
+                  confirmLabel: tx(i18n, "removeAttachment", "Remove attachment"),
                 },
-              }, "×"),
+                onConfirm: function () {
+                  setPendingRemoveId(null);
+                  if (props.onDelete) props.onDelete(a.id);
+                },
+                onCancel: function () { setPendingRemoveId(null); },
+              }) : null,
             );
           }),
     );
@@ -3841,9 +3956,26 @@
     const [specifyMsg, setSpecifyMsg] = useState(null);
     const [decomposeBusy, setDecomposeBusy] = useState(false);
     const [decomposeMsg, setDecomposeMsg] = useState(null);
-    const b = function (label, patch, enabled, confirmMsg) {
+    // Destructive status changes arm an inline confirm row instead of a
+    // browser-native popup; the PATCH only fires from the Confirm button.
+    const [pendingConfirm, setPendingConfirm] = useState(null);
+    const clearPendingConfirm = useCallback(function () { setPendingConfirm(null); }, []);
+    const b = function (label, patch, enabled, confirmSpec) {
       return h(Button, {
-        onClick: function () { if (enabled !== false) props.onPatch(patch, { confirm: confirmMsg }); },
+        onClick: function () {
+          if (enabled === false) return;
+          if (confirmSpec && confirmSpec.message) {
+            setPendingConfirm({
+              key: confirmSpec.key,
+              message: confirmSpec.message,
+              confirmLabel: label,
+              patch: patch,
+            });
+            return;
+          }
+          clearPendingConfirm();
+          props.onPatch(patch);
+        },
         disabled: enabled === false,
         size: "sm",
       }, label);
@@ -3944,14 +4076,24 @@
         // claim lock, and worker process metadata.
         b(tx(t, "block", "Block"),     { status: "blocked" },
           task.status === "running" || task.status === "ready",
-          getDestructiveConfirm(t, "blocked")),
-        b(tx(t, "unblock", "Unblock"),   { status: "ready" },    task.status === "blocked"),
+          { key: "block", message: getDestructiveConfirm(t, "blocked") }),
+        b(tx(t, "unblock", "Unblock"),   { status: "ready" },    task.status === "blocked",
+          { key: "unblock", message: tx(t, "confirmUnblock",
+            "Unblock this task? It returns to Ready and the dispatcher may pick it up.") }),
         b(tx(t, "complete", "Complete"),  { status: "done" },
           task.status === "running" || task.status === "ready" || task.status === "blocked",
-          getDestructiveConfirm(t, "done")),
+          { key: "complete", message: getDestructiveConfirm(t, "done") }),
         b(tx(t, "archive", "Archive"),   { status: "archived" }, task.status !== "archived",
-          getDestructiveConfirm(t, "archived")),
+          { key: "archive", message: getDestructiveConfirm(t, "archived") }),
       ),
+      h(InlineConfirm, {
+        confirm: pendingConfirm,
+        onConfirm: function () {
+          props.onPatch(pendingConfirm.patch);
+          clearPendingConfirm();
+        },
+        onCancel: clearPendingConfirm,
+      }),
       specifyMsg ? h("div", {
         className: specifyMsg.ok
           ? "hermes-kanban-msg-ok"
