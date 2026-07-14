@@ -43,6 +43,13 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     (profile_home / "config.yaml").write_text(
         yaml.safe_dump(
             {
+                # Discovery blocks HermesCLI's one-time tool snapshot, and
+                # ``thread.join`` returns the instant discovery finishes — so a
+                # generous cap costs ~0s locally but keeps a cold CI runner
+                # (fresh interpreter + heavy ``mcp.server.fastmcp`` import +
+                # stdio handshake) from timing out under the 1.5s default and
+                # snapshotting the tool list before ``profileprobe`` connects.
+                "mcp_discovery_timeout": 20,
                 "mcp_servers": {
                     "profileprobe": {
                         "enabled": True,
