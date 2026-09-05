@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from gateway.lifecycle_ledger import (
     read_prior_exit_label,
     record_startup,
     sample_memory,
+    check_state_db_integrity,
 )
 
 
@@ -31,6 +33,49 @@ from gateway.lifecycle_ledger import (
 # ---------------------------------------------------------------------------
 
 _DEAD_PID = 2 ** 22 + 12345  # beyond default pid_max on Linux; never alive
+
+
+def test_integrity_budget_interrupts_real_sqlite_and_startup_still_claims(tmp_path, monkeypatch, caplog):
+    """A healthy large store must not hold the gateway's startup indefinitely."""
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        conn.execute("CREATE TABLE messages(body TEXT)")
+        conn.executemany("INSERT INTO messages VALUES (?)", [("x" * 100,)] * 2000)
+    ticks = iter([0.0, 6.0])
+    monkeypatch.setattr("gateway.lifecycle_ledger.time.monotonic", lambda: next(ticks, 6.0))
+    _write_sentinel(tmp_path, {"phase": "running", "pid": _DEAD_PID})
+    evidence = record_startup(home=tmp_path)
+    assert evidence["state_db_integrity"].startswith("check-incomplete:")
+    assert _read_sentinel(tmp_path)["pid"] == os.getpid()
+    assert _exit_diag_records(tmp_path)[0]["state_db_integrity"] == evidence["state_db_integrity"]
+    assert "FAILED integrity" not in caplog.text
+    # Cancellation closed the connection and did not damage or retain a lock on the store.
+    with sqlite3.connect(tmp_path / "state.db", timeout=0) as conn:
+        conn.execute("INSERT INTO messages VALUES ('after')")
+        assert conn.execute("PRAGMA quick_check(1)").fetchone() == ("ok",)
+
+
+def test_integrity_healthy_and_corrupt_stores(tmp_path, caplog):
+    assert check_state_db_integrity(tmp_path) == "absent"
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        conn.execute("CREATE TABLE messages(body TEXT)")
+    assert check_state_db_integrity(tmp_path) == "ok"
+    (tmp_path / "state.db").write_bytes(b"not a database" * 100)
+    assert check_state_db_integrity(tmp_path).startswith("corrupt:")
+    _write_sentinel(tmp_path, {"phase": "running", "pid": _DEAD_PID})
+    record_startup(home=tmp_path)
+    assert any(r.levelname == "ERROR" and "FAILED integrity" in r.message for r in caplog.records)
+
+
+def test_integrity_busy_store_is_unverified_not_corrupt(tmp_path, caplog):
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        conn.execute("CREATE TABLE messages(body TEXT)")
+        conn.commit()
+        conn.execute("BEGIN EXCLUSIVE")
+        _write_sentinel(tmp_path, {"phase": "running", "pid": _DEAD_PID})
+        evidence = record_startup(home=tmp_path)
+        assert evidence["state_db_integrity"].startswith("check-failed:")
+        assert "unverified" in caplog.text
+        assert "FAILED integrity" not in caplog.text
 
 
 def _write_sentinel(home: Path, payload: dict) -> Path:
