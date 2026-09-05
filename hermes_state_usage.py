@@ -95,6 +95,9 @@ class SessionUsageMixin:
         self.flush_token_counts()
 
         def _do(conn):
+            previous = conn.execute(
+                "SELECT system_prompt_hash FROM sessions WHERE id = ?", (session_id,),
+            ).fetchone()
             conn.execute("""UPDATE sessions SET
                    billing_provider = ?,
                    billing_base_url = ?,
@@ -102,7 +105,8 @@ class SessionUsageMixin:
                    system_prompt = NULL,
                    system_prompt_hash = NULL
                    WHERE id = ?""", (provider, base_url, billing_mode, session_id))
-            self._delete_unreferenced_system_prompts(conn)
+            if previous is not None:
+                self._delete_unreferenced_system_prompt(conn, previous[0])
         self._execute_write(_do)
 
     def queue_token_counts(self, session_id: str, **kwargs) -> None:

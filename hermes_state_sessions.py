@@ -2,6 +2,7 @@
 flags (end/reopen/archive/pin/hide/read), model_config patching, listing and
 counting, delete cascades, and the auto-archive sweep."""
 
+import hashlib
 import json
 import logging
 import re
@@ -353,7 +354,7 @@ class SessionSessionsMixin:
                 ),
             )
             if system_prompt_hash is not None:
-                self._delete_unreferenced_system_prompts(conn)
+                self._delete_unreferenced_system_prompt(conn, system_prompt_hash)
             if parent_session_id:
                 self._inherit_parent_session_metadata(conn, session_id)
         # Transcript-critical: a failed row creation aborts the turn.
@@ -613,12 +614,20 @@ class SessionSessionsMixin:
 
     def update_system_prompt(self, session_id: str, system_prompt: Optional[str]) -> None:
         """Store the full assembled system prompt snapshot."""
+        prompt_hash = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest() if system_prompt is not None else None
+
         def _do(conn):
+            previous = conn.execute(
+                "SELECT system_prompt_hash, system_prompt FROM sessions WHERE id = ?", (session_id,),
+            ).fetchone()
+            if previous is None or (previous[0] == prompt_hash and previous[1] is None):
+                return
             conn.execute(
                 "UPDATE sessions SET system_prompt_hash = ?, system_prompt = NULL WHERE id = ?",
                 (self._store_system_prompt(conn, system_prompt), session_id),
             )
-            self._delete_unreferenced_system_prompts(conn)
+            if previous[0] != prompt_hash:
+                self._delete_unreferenced_system_prompt(conn, previous[0])
         self._execute_write(_do)
 
     def update_session_tool_names(self, session_id: str, tool_names: Optional[List[str]]) -> None:
@@ -662,9 +671,12 @@ class SessionSessionsMixin:
             merged = self._merge_model_config_json(conn, session_id, patch)
             if merged is _MODEL_CONFIG_ROW_MISSING:
                 return
+            previous = conn.execute(
+                "SELECT system_prompt_hash FROM sessions WHERE id = ?", (session_id,),
+            ).fetchone() if params is not None else None
             conn.execute(sql, params(merged) if params else (merged, session_id))
-            if params is not None:
-                self._delete_unreferenced_system_prompts(conn)
+            if previous is not None:
+                self._delete_unreferenced_system_prompt(conn, previous[0])
         self._execute_write(_do)
 
     def _merge_model_config_json(

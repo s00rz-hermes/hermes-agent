@@ -266,3 +266,89 @@ def test_compact_rows_omit_hash_and_never_read_prompt_blob(db):
     assert "system_prompt_hash" not in rows[0]
     assert "system_prompt" not in rich
     assert "system_prompt_hash" not in rich
+
+
+@pytest.mark.parametrize("operation", ["replace", "unchanged", "enrich", "route", "runtime", "billing"])
+def test_prompt_hot_paths_do_not_scan_unrelated_prompt_history(db, operation):
+    """SQLite work per changed reference stays bounded as unrelated history grows."""
+    import hashlib
+
+    def seed(start, stop):
+        rows = [(f"unrelated-{i}", hashlib.sha256(f"prompt-{i}".encode()).hexdigest(), f"prompt-{i}")
+                for i in range(start, stop)]
+        db._execute_write(lambda conn: (
+            conn.executemany("INSERT INTO system_prompts(hash, prompt) VALUES (?, ?)",
+                             [(h, prompt) for _, h, prompt in rows]),
+            conn.executemany("INSERT INTO sessions(id, source, started_at, system_prompt_hash) VALUES (?, 'cli', 0, ?)",
+                             [(sid, h) for sid, h, _ in rows]),
+        ))
+
+    def measure(sid):
+        db.create_session(sid, "cli", system_prompt="old " + sid)
+        steps = 0
+
+        def count_steps():
+            nonlocal steps
+            steps += 1
+            return 0
+
+        db._conn.set_progress_handler(count_steps, 1)
+        try:
+            if operation == "replace":
+                db.update_system_prompt(sid, "new " + sid)
+            elif operation == "unchanged":
+                db.update_system_prompt(sid, "old " + sid)
+            elif operation == "enrich":
+                db.create_session(sid, "cli", system_prompt="unused " + sid)
+            elif operation == "route":
+                db.update_session_model(sid, model="model-b", provider="provider-b")
+            elif operation == "runtime":
+                db.update_session_runtime_lock(sid, model="model-b", provider="provider-b", confirmed=True)
+            else:
+                db.update_session_billing_route(sid, provider="provider-b", base_url="https://example.test")
+        finally:
+            db._conn.set_progress_handler(None, 0)
+        return steps
+
+    seed(0, 20)
+    small = measure("small")
+    seed(20, 4000)
+    large = measure("large")
+    assert large <= small * 3 + 2000, (operation, small, large)
+    assert db.get_session("unrelated-3999")["system_prompt"] == "prompt-3999"
+
+
+def test_unchanged_prompt_update_performs_no_row_writes(db):
+    db.create_session("same", "cli", system_prompt="full snapshot")
+    before = db._conn.total_changes
+    db.update_system_prompt("same", "full snapshot")
+    assert db._conn.total_changes == before
+    assert db.get_session("same")["system_prompt"] == "full snapshot"
+
+
+def test_missing_prompt_update_creates_no_orphan(db):
+    db.update_system_prompt("missing", "unused snapshot")
+    assert _prompt_count(db) == 0
+
+
+def test_inline_prompt_is_cleared_when_new_prompt_is_none(db):
+    db.create_session("legacy", "cli")
+    db._execute_write(lambda conn: conn.execute(
+        "UPDATE sessions SET system_prompt = 'legacy inline' WHERE id = 'legacy'"
+    ))
+    db.update_system_prompt("legacy", None)
+    assert db.get_session("legacy")["system_prompt"] is None
+
+
+def test_targeted_prompt_cleanup_preserves_unrelated_orphans_for_maintenance(db):
+    db.create_session("target", "cli", system_prompt="replaced")
+    db._execute_write(lambda conn: conn.execute(
+        "INSERT INTO system_prompts(hash, prompt) VALUES ('orphan', 'unrelated orphan')"
+    ))
+    db.update_system_prompt("target", "replacement")
+    assert {row[0] for row in db._conn.execute("SELECT prompt FROM system_prompts")} == {
+        "replacement", "unrelated orphan",
+    }
+    db._execute_write(db._delete_unreferenced_system_prompts)
+    assert _prompt_count(db) == 1
+    assert db.get_session("target")["system_prompt"] == "replacement"

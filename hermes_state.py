@@ -385,6 +385,21 @@ class SessionDB(
         return prompt_hash
 
     @staticmethod
+    def _delete_unreferenced_system_prompt(conn, prompt_hash: Optional[str]) -> None:
+        """Collect only a prompt affected by this write, preserving shared snapshots.
+
+        The caller holds the write transaction across the reference change and
+        this check. A global sweep here makes every turn scan all stored prompts.
+        Bulk deletion/maintenance keeps the separate full orphan sweep.
+        """
+        if prompt_hash is not None:
+            conn.execute(
+                "DELETE FROM system_prompts WHERE hash = ? AND NOT EXISTS ("
+                "SELECT 1 FROM sessions WHERE sessions.system_prompt_hash = system_prompts.hash)",
+                (prompt_hash,),
+            )
+
+    @staticmethod
     def _delete_unreferenced_system_prompts(conn) -> None:
         conn.execute(
             "DELETE FROM system_prompts WHERE NOT EXISTS ("
